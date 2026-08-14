@@ -1,0 +1,77 @@
+﻿import asyncio
+from playwright.async_api import async_playwright
+
+
+class BrowserClient:
+
+    def __init__(self, concurrency=5):
+
+        self.concurrency = concurrency
+        self.playwright = None
+        self.browser = None
+        self.semaphore = asyncio.Semaphore(
+            concurrency
+        )
+
+    async def start(self):
+
+        self.playwright = (
+            await async_playwright().start()
+        )
+
+        self.browser = (
+            await self.playwright.chromium.launch(
+                headless=True
+            )
+        )
+
+    async def get(self, url):
+
+        async with self.semaphore:
+
+            page = await self.browser.new_page()
+
+            try:
+
+                response = await page.goto(
+                    url,
+                    wait_until="networkidle",
+                    timeout=60000
+                )
+
+                html = await page.content()
+
+                return {
+                    "response": response,
+                    "html": html,
+                    "url": page.url,
+                    "status": (
+                        response.status
+                        if response
+                        else 0
+                    )
+                }
+
+            except Exception as e:
+
+                return {
+                    "response": None,
+                    "html": "",
+                    "url": url,
+                    "status": 0,
+                    "error": str(e)
+                }
+
+            finally:
+
+                await page.close()
+
+    async def close(self):
+
+        if self.browser:
+
+            await self.browser.close()
+
+        if self.playwright:
+
+            await self.playwright.stop()

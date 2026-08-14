@@ -1,0 +1,477 @@
+import asyncio
+import hashlib
+import json
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+from app.crawler.browser import BrowserClient
+from app.crawler.http import HTTPClient
+from app.crawler.parser import parse_html
+from app.storage.db import save_page, save_issue, save_image, save_resource, save_hreflang, save_schema
+from app.storage.persistence import CrawlPersistence
+from app.analyzers.technical import analyze
+from app.utils.urls import normalize_url, same_host
+
+
+class ProductionCrawler:
+
+    def __init__(
+        self,
+        crawl_id,
+        start_url,
+        max_pages=100000,
+        max_depth=50,
+        concurrency=20
+    ):
+        self.crawl_id = crawl_id
+        self.start_url = normalize_url(start_url)
+
+        self.max_pages = int(max_pages)
+        self.max_depth = int(max_depth)
+        self.concurrency = int(concurrency)
+
+        self.discovered = set()
+        self.crawled = set()
+        self.failed = set()
+
+        self.queue = []
+        self.running = True
+
+        self.http = HTTPClient(concurrency=self.concurrency)
+        self.browser = BrowserClient()
+
+        self.persistence = CrawlPersistence(self.crawl_id)
+
+    def _add_url(self, url, depth):
+        try:
+            url = normalize_url(url)
+        except Exception:
+            return False
+
+        if not url:
+            return False
+
+        if not same_host(url, self.start_url):
+            return False
+
+        if depth > self.max_depth:
+            return False
+
+        if url in self.discovered:
+            return False
+
+        if len(self.discovered) >= self.max_pages:
+            return False
+
+        self.discovered.add(url)
+        self.queue.append((url, depth))
+
+        return True
+
+    def _persist_page(self, page):
+        self.persistence.save_page(page)
+
+    def _persist_link(self, link):
+        self.persistence.save_link(link)
+
+    def _persist_failed(self, url, error):
+        self.persistence.save_failed({
+            "url": url,
+            "error": str(error) if error else None
+        })
+
+    async def process(self, url, depth):
+        try:
+            result = await self.http.get(url)
+
+            response = result.get("response")
+
+            if not response:
+                self.failed.add(url)
+
+                self._persist_failed(
+                    url,
+                    result.get("error")
+                )
+
+                page = {
+                    "url": url,
+                    "final_url": url,
+                    "status_code": 0,
+                    "depth": depth,
+                    "content_type": "",
+                    "response_time": result.get("elapsed", 0),
+                    "content_length": 0,
+                    "title": "",
+                    "meta_description": "",
+                    "canonical": "",
+                    "robots": "",
+                    "language": "",
+                    "viewport": "",
+                    "word_count": 0,
+                    "content_hash": "",
+                    "is_indexable": False,
+                    "redirect": False,
+                    "error": str(result.get("error"))
+                }
+
+                await save_page(self.crawl_id, page)
+                self._persist_page(page)
+
+                return
+
+            status = getattr(response, "status_code", 0)
+            final_url = getattr(response, "url", url)
+
+            headers = getattr(response, "headers", {}) or {}
+            content_type = headers.get(
+                "content-type",
+                ""
+            )
+
+            content = getattr(
+                response,
+                "content",
+                b""
+            ) or b""
+
+            text = getattr(
+                response,
+                "text",
+                ""
+            ) or ""
+
+            if "text/html" not in content_type.lower():
+                page = {
+                    "url": url,
+                    "final_url": final_url,
+                    "status_code": status,
+                    "depth": depth,
+                    "content_type": content_type,
+                    "response_time": result.get("elapsed", 0),
+                    "content_length": len(content),
+                    "title": "",
+                    "meta_description": "",
+                    "canonical": "",
+                    "robots": "",
+                    "language": "",
+                    "viewport": "",
+                    "word_count": 0,
+                    "content_hash": hashlib.sha256(
+                        content
+                    ).hexdigest(),
+                    "is_indexable": False,
+                    "redirect": final_url != url,
+                    "error": None
+                }
+
+                await save_page(self.crawl_id, page)
+                self._persist_page(page)
+
+                return
+
+            parsed = parse_html(
+                text,
+                final_url
+            )
+
+            page_text = parsed.get(
+                "text",
+                ""
+            )
+
+            content_hash = hashlib.sha256(
+                page_text.encode(
+                    "utf-8",
+                    errors="ignore"
+                )
+            ).hexdigest()
+
+            robots = parsed.get(
+                "robots",
+                ""
+            ) or ""
+
+            is_indexable = (
+                status == 200
+                and "noindex" not in robots.lower()
+            )
+
+            page = {
+                "url": url,
+                "final_url": final_url,
+                "status_code": status,
+                "depth": depth,
+                "content_type": content_type,
+                "response_time": result.get("elapsed", 0),
+                "content_length": len(content),
+                "title": parsed.get("title", ""),
+                "meta_description": parsed.get(
+                    "meta_description",
+                    ""
+                ),
+                "canonical": parsed.get(
+                    "canonical",
+                    ""
+                ),
+                "robots": robots,
+                "language": parsed.get(
+                    "language",
+                    ""
+                ),
+                "viewport": parsed.get(
+                    "viewport",
+                    ""
+                ),
+                "word_count": parsed.get(
+                    "word_count",
+                    0
+                ),
+                "content_hash": content_hash,
+                "is_indexable": is_indexable,
+                "redirect": final_url != url,
+                "error": None
+            }
+
+            await save_page(
+                self.crawl_id,
+                page
+            )
+
+            self._persist_page(page)
+
+            try:
+                for issue in analyze(page):
+                    await save_issue(
+                        self.crawl_id,
+                        issue
+                    )
+            except Exception as e:
+                self._persist_failed(
+                    url,
+                    "analysis: " + str(e)
+                )
+
+            for image in parsed.get(
+                "images",
+                []
+            ):
+                try:
+                    await save_image(
+                        self.crawl_id,
+                        image
+                    )
+                except Exception:
+                    pass
+
+            for script in parsed.get(
+                "scripts",
+                []
+            ):
+                try:
+                    await save_resource(
+                        self.crawl_id,
+                        "javascript"
+                    )
+                except Exception:
+                    pass
+
+            for stylesheet in parsed.get(
+                "stylesheets",
+                []
+            ):
+                try:
+                    await save_resource(
+                        self.crawl_id,
+                        "stylesheet"
+                    )
+                except Exception:
+                    pass
+
+            for item in parsed.get(
+                "hreflang",
+                []
+            ):
+                try:
+                    await save_hreflang(
+                        self.crawl_id,
+                        item
+                    )
+                except Exception:
+                    pass
+
+            for schema in parsed.get(
+                "schemas",
+                []
+            ):
+                try:
+                    await save_schema(
+                        self.crawl_id,
+                        schema
+                    )
+                except Exception:
+                    pass
+
+            links = parsed.get(
+                "links",
+                []
+            )
+
+            internal_added = 0
+
+            for link in links:
+                try:
+                    self._persist_link({
+                        "source_url": url,
+                        "target_url": link.get(
+                            "url"
+                        ),
+                        "anchor": link.get(
+                            "anchor",
+                            ""
+                        )
+                    })
+                except Exception:
+                    pass
+
+                raw_url = link.get(
+                    "url"
+                )
+
+                if not raw_url:
+                    continue
+
+                try:
+                    absolute = urljoin(
+                        final_url,
+                        raw_url
+                    )
+
+                    if self._add_url(
+                        absolute,
+                        depth + 1
+                    ):
+                        internal_added += 1
+
+                except Exception:
+                    continue
+
+            print(
+                f"[CRAWL] {url} | "
+                f"status={status} | "
+                f"links={len(links)} | "
+                f"internal_added={internal_added} | "
+                f"queue={len(self.queue)} | "
+                f"discovered={len(self.discovered)} | "
+                f"crawled={len(self.crawled)}"
+            )
+
+        except Exception as e:
+            self.failed.add(url)
+
+            self._persist_failed(
+                url,
+                e
+            )
+
+            print(
+                f"[FAILED] {url} | {type(e).__name__}: {e}"
+            )
+
+    async def run(self):
+        self._add_url(
+            self.start_url,
+            0
+        )
+
+        self.persistence.update_meta(
+            start_url=self.start_url,
+            max_pages=self.max_pages,
+            max_depth=self.max_depth,
+            concurrency=self.concurrency,
+            status="running"
+        )
+
+        try:
+            while (
+                self.queue
+                and len(self.crawled) < self.max_pages
+                and self.running
+            ):
+                batch = []
+
+                while (
+                    self.queue
+                    and len(batch) < self.concurrency
+                    and len(self.crawled) < self.max_pages
+                ):
+                    url, depth = self.queue.pop(0)
+
+                    if url in self.crawled:
+                        continue
+
+                    self.crawled.add(url)
+
+                    batch.append(
+                        self.process(
+                            url,
+                            depth
+                        )
+                    )
+
+                if batch:
+                    await asyncio.gather(
+                        *batch,
+                        return_exceptions=True
+                    )
+
+                self.persistence.update_meta(
+                    pages_saved=len(
+                        self.crawled
+                    ),
+                    discovered=len(
+                        self.discovered
+                    ),
+                    failed=len(
+                        self.failed
+                    )
+                )
+
+            self.persistence.finish(
+                "completed"
+            )
+
+            print("")
+            print("========== CRAWL COMPLETE ==========")
+            print(
+                f"Discovered: {len(self.discovered)}"
+            )
+            print(
+                f"Crawled: {len(self.crawled)}"
+            )
+            print(
+                f"Failed: {len(self.failed)}"
+            )
+
+        except Exception as e:
+            self.persistence.finish(
+                "failed"
+            )
+
+            print(
+                f"CRAWL {self.crawl_id} FAILED: "
+                f"{type(e).__name__}: {e}"
+            )
+
+            raise
+
+        finally:
+            try:
+                await self.http.close()
+            except Exception:
+                pass
+
+            try:
+                await self.browser.stop()
+            except Exception:
+                pass

@@ -1,0 +1,11 @@
+httpx[http2]>=0.28
+beautifulsoup4>=4.13
+lxml>=6.0
+fastapi>=0.116
+uvicorn[standard]>=0.35
+pydantic>=2.11
+aiosqlite>=0.21
+tldextract>=5.3
+orjson>=3.11
+xxhash>=3.5
+selectolax>=0.3.33

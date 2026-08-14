@@ -1,0 +1,543 @@
+import json
+from pathlib import Path
+import aiosqlite
+
+from app.config import DATABASE_PATH
+
+
+async def initialize():
+
+    DATABASE_PATH.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    async with aiosqlite.connect(
+        DATABASE_PATH
+    ) as db:
+
+        await db.executescript("""
+
+        PRAGMA journal_mode=WAL;
+
+        CREATE TABLE IF NOT EXISTS crawls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            start_url TEXT NOT NULL,
+            status TEXT NOT NULL,
+            max_pages INTEGER,
+            max_depth INTEGER,
+            concurrency INTEGER,
+            pages_discovered INTEGER DEFAULT 0,
+            pages_crawled INTEGER DEFAULT 0,
+            pages_indexable INTEGER DEFAULT 0,
+            started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            finished_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS pages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crawl_id INTEGER NOT NULL,
+            url TEXT NOT NULL,
+            final_url TEXT,
+            status_code INTEGER,
+            depth INTEGER,
+            content_type TEXT,
+            response_time REAL,
+            content_length INTEGER,
+            title TEXT,
+            title_length INTEGER,
+            meta_description TEXT,
+            meta_description_length INTEGER,
+            canonical TEXT,
+            robots TEXT,
+            language TEXT,
+            viewport TEXT,
+            word_count INTEGER,
+            content_hash TEXT,
+            is_indexable INTEGER,
+            redirect INTEGER DEFAULT 0,
+            error TEXT,
+            UNIQUE(crawl_id, url)
+        );
+
+        CREATE TABLE IF NOT EXISTS links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crawl_id INTEGER,
+            source_url TEXT,
+            destination_url TEXT,
+            anchor TEXT,
+            internal INTEGER,
+            nofollow INTEGER,
+            sponsored INTEGER,
+            ugc INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crawl_id INTEGER,
+            page_url TEXT,
+            image_url TEXT,
+            alt TEXT,
+            width TEXT,
+            height TEXT,
+            loading TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS resources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crawl_id INTEGER,
+            page_url TEXT,
+            resource_url TEXT,
+            resource_type TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS hreflang (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crawl_id INTEGER,
+            page_url TEXT,
+            language TEXT,
+            target_url TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS schemas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crawl_id INTEGER,
+            page_url TEXT,
+            schema_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS issues (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crawl_id INTEGER,
+            url TEXT,
+            issue_type TEXT,
+            severity TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS discovered_urls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crawl_id INTEGER,
+            url TEXT,
+            source_url TEXT,
+            source_type TEXT,
+            depth INTEGER,
+            crawled INTEGER DEFAULT 0,
+            UNIQUE(crawl_id, url)
+        );
+
+        CREATE TABLE IF NOT EXISTS sitemaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crawl_id INTEGER,
+            sitemap_url TEXT,
+            status_code INTEGER,
+            url_count INTEGER DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pages_crawl
+        ON pages(crawl_id);
+
+        CREATE INDEX IF NOT EXISTS idx_pages_url
+        ON pages(url);
+
+        CREATE INDEX IF NOT EXISTS idx_links_source
+        ON links(source_url);
+
+        CREATE INDEX IF NOT EXISTS idx_links_destination
+        ON links(destination_url);
+
+        CREATE INDEX IF NOT EXISTS idx_issues_type
+        ON issues(issue_type);
+
+        CREATE INDEX IF NOT EXISTS idx_discovered_url
+        ON discovered_urls(url);
+
+        """)
+
+        await db.commit()
+
+
+async def create_crawl(
+    start_url,
+    max_pages,
+    max_depth,
+    concurrency
+):
+
+    async with aiosqlite.connect(
+        DATABASE_PATH
+    ) as db:
+
+        cursor = await db.execute(
+            """
+            INSERT INTO crawls
+            (
+                start_url,
+                status,
+                max_pages,
+                max_depth,
+                concurrency
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                start_url,
+                "queued",
+                max_pages,
+                max_depth,
+                concurrency
+            )
+        )
+
+        await db.commit()
+
+        return cursor.lastrowid
+
+
+async def update_crawl(
+    crawl_id,
+    **fields
+):
+
+    if not fields:
+        return
+
+    columns = ", ".join(
+        f"{key}=?"
+        for key in fields
+    )
+
+    values = list(
+        fields.values()
+    )
+
+    values.append(crawl_id)
+
+    async with aiosqlite.connect(
+        DATABASE_PATH
+    ) as db:
+
+        await db.execute(
+            f"""
+            UPDATE crawls
+            SET {columns}
+            WHERE id=?
+            """,
+            values
+        )
+
+        await db.commit()
+
+
+async def save_page(
+
+
+    # CRAWL_JSONL_PERSISTENCE
+    # Persist every page immediately so a failed crawl never loses data.
+    try:
+        result_dir = Path("results")
+        result_dir.mkdir(parents=True, exist_ok=True)
+
+        result_file = (
+            result_dir /
+            f"crawl_{crawl_id}.jsonl"
+        )
+
+        with result_file.open(
+            "a",
+            encoding="utf-8"
+        ) as f:
+            f.write(
+                json.dumps(
+                    {
+                        "type": "page",
+                        "crawl_id": crawl_id,
+                        "page": page
+                    },
+                    ensure_ascii=False
+                ) + "\n"
+            )
+            f.flush()
+
+    except Exception as persist_error:
+        print(
+            f"[PERSISTENCE ERROR] "
+            f"{type(persist_error).__name__}: "
+            f"{persist_error}"
+        )
+    crawl_id,
+    page
+):
+
+    async with aiosqlite.connect(
+        DATABASE_PATH
+    ) as db:
+
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO pages
+            (
+                crawl_id,
+                url,
+                final_url,
+                status_code,
+                depth,
+                content_type,
+                response_time,
+                content_length,
+                title,
+                title_length,
+                meta_description,
+                meta_description_length,
+                canonical,
+                robots,
+                language,
+                viewport,
+                word_count,
+                content_hash,
+                is_indexable,
+                redirect,
+                error
+            )
+            VALUES (
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            )
+            """,
+            (
+                crawl_id,
+                page["url"],
+                page.get("final_url"),
+                page.get("status_code"),
+                page.get("depth"),
+                page.get("content_type"),
+                page.get("response_time"),
+                page.get("content_length"),
+                page.get("title"),
+                len(page.get("title", "")),
+                page.get("meta_description"),
+                len(page.get(
+                    "meta_description",
+                    ""
+                )),
+                page.get("canonical"),
+                page.get("robots"),
+                page.get("language"),
+                page.get("viewport"),
+                page.get("word_count"),
+                page.get("content_hash"),
+                int(page.get(
+                    "is_indexable",
+                    False
+                )),
+                int(page.get(
+                    "redirect",
+                    False
+                )),
+                page.get("error")
+            )
+        )
+
+        await db.commit()
+
+
+async def save_issue(
+    crawl_id,
+    issue
+):
+
+    async with aiosqlite.connect(
+        DATABASE_PATH
+    ) as db:
+
+        await db.execute(
+            """
+            INSERT INTO issues
+            (
+                crawl_id,
+                url,
+                issue_type,
+                severity
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                crawl_id,
+                issue["url"],
+                issue["type"],
+                issue["severity"]
+            )
+        )
+
+        await db.commit()
+
+
+async def save_link(
+    crawl_id,
+    source,
+    link
+):
+
+    async with aiosqlite.connect(
+        DATABASE_PATH
+    ) as db:
+
+        await db.execute(
+            """
+            INSERT INTO links
+            (
+                crawl_id,
+                source_url,
+                destination_url,
+                anchor,
+                internal,
+                nofollow,
+                sponsored,
+                ugc
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                crawl_id,
+                source,
+                link["url"],
+                link.get("anchor"),
+                int(link.get("internal")),
+                int(link.get("nofollow")),
+                int(link.get("sponsored")),
+                int(link.get("ugc"))
+            )
+        )
+
+        await db.commit()
+
+
+async def save_image(
+    crawl_id,
+    page_url,
+    image
+):
+
+    async with aiosqlite.connect(
+        DATABASE_PATH
+    ) as db:
+
+        await db.execute(
+            """
+            INSERT INTO images
+            (
+                crawl_id,
+                page_url,
+                image_url,
+                alt,
+                width,
+                height,
+                loading
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                crawl_id,
+                page_url,
+                image["url"],
+                image.get("alt"),
+                image.get("width"),
+                image.get("height"),
+                image.get("loading")
+            )
+        )
+
+        await db.commit()
+
+
+async def save_resource(
+    crawl_id,
+    page_url,
+    resource_url,
+    resource_type
+):
+
+    async with aiosqlite.connect(
+        DATABASE_PATH
+    ) as db:
+
+        await db.execute(
+            """
+            INSERT INTO resources
+            (
+                crawl_id,
+                page_url,
+                resource_url,
+                resource_type
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                crawl_id,
+                page_url,
+                resource_url,
+                resource_type
+            )
+        )
+
+        await db.commit()
+
+
+async def save_hreflang(
+    crawl_id,
+    page_url,
+    item
+):
+
+    async with aiosqlite.connect(
+        DATABASE_PATH
+    ) as db:
+
+        await db.execute(
+            """
+            INSERT INTO hreflang
+            (
+                crawl_id,
+                page_url,
+                language,
+                target_url
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                crawl_id,
+                page_url,
+                item["lang"],
+                item["url"]
+            )
+        )
+
+        await db.commit()
+
+
+async def save_schema(
+    crawl_id,
+    page_url,
+    schema
+):
+
+    async with aiosqlite.connect(
+        DATABASE_PATH
+    ) as db:
+
+        await db.execute(
+            """
+            INSERT INTO schemas
+            (
+                crawl_id,
+                page_url,
+                schema_json
+            )
+            VALUES (?, ?, ?)
+            """,
+            (
+                crawl_id,
+                page_url,
+                schema
+            )
+        )
+
+        await db.commit()
