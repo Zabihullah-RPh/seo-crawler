@@ -3,6 +3,8 @@ name: SEO Crawler
 on:
   push:
     branches: [main]
+  issues:
+    types: [opened]
   workflow_dispatch:
     inputs:
       url:
@@ -16,6 +18,7 @@ on:
 
 jobs:
   crawl:
+    if: github.event_name != 'issues' || startsWith(github.event.issue.title, 'SEO CRAWL:')
     runs-on: ubuntu-latest
 
     steps:
@@ -36,9 +39,13 @@ jobs:
 
       - name: Start crawler and run crawl
         env:
-          TARGET_URL: ${{ github.event.inputs.url || 'https://weeklypakistan.com.pk/' }}
-          MAX_PAGES: ${{ github.event.inputs.max_pages || '10' }}
+          TARGET_URL: ${{ github.event_name == 'issues' && github.event.issue.body || github.event.inputs.url || 'https://weeklypakistan.com.pk/' }}
+          MAX_PAGES: ${{ github.event_name == 'issues' && '10' || github.event.inputs.max_pages || '10' }}
         run: |
+          TARGET_URL=$(printf '%s' "$TARGET_URL" | tr -d '\r\n' | xargs)
+          echo "Target URL: $TARGET_URL"
+          echo "Maximum pages: $MAX_PAGES"
+
           python -m uvicorn app.api:app --host 127.0.0.1 --port 8000 > crawler.log 2>&1 &
           SERVER_PID=$!
 
