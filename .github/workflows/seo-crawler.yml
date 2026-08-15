@@ -1,0 +1,63 @@
+name: SEO Crawler
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Website URL to crawl"
+        required: true
+        default: "https://weeklypakistan.com.pk/"
+      max_pages:
+        description: "Maximum pages"
+        required: true
+        default: "10"
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start crawler API
+        run: |
+          nohup uvicorn app.api:app --host 127.0.0.1 --port 8000 > crawler.log 2>&1 &
+          sleep 5
+
+      - name: Start crawl
+        env:
+          TARGET_URL: ${{ github.event.inputs.url }}
+          MAX_PAGES: ${{ github.event.inputs.max_pages }}
+        run: |
+          python -c "import os,requests; r=requests.post('http://127.0.0.1:8000/crawl',json={'url':os.environ['TARGET_URL'],'max_pages':int(os.environ['MAX_PAGES'])}); print(r.text); open('crawl_response.txt','w').write(r.text)"
+
+      - name: Wait for crawler
+        run: |
+          sleep 30
+
+      - name: Show crawler log
+        if: always()
+        run: cat crawler.log
+
+      - name: Save crawl results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seo-crawl-results
+          path: |
+            data/
+            results/
+            crawl_response.txt
+            crawler.log
+          if-no-files-found: warn
