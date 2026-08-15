@@ -30,31 +30,34 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Start crawler API
-        run: |
-          nohup uvicorn app.api:app --host 127.0.0.1 --port 8000 > crawler.log 2>&1 &
-          SERVER_PID=$!
-          echo "SERVER_PID=$SERVER_PID" >> "$GITHUB_ENV"
-
-          for i in {1..30}; do
-            if curl -s http://127.0.0.1:8000/docs > /dev/null; then
-              echo "Server is ready!"
-              exit 0
-            fi
-
-            if ! kill -0 $SERVER_PID 2>/dev/null; then
-              echo "Uvicorn stopped unexpectedly."
-              cat crawler.log
-              exit 1
-            fi
-
-            echo "Waiting for server... ($i/30)"
-            sleep 1
-          done
-
-          echo "Server did not become ready."
-          cat crawler.log
-          exit 1
+- name: Start crawler API
+  run: |
+    # Start server and capture PID
+    nohup uvicorn app.api:app --host 127.0.0.1 --port 8000 > crawler.log 2>&1 &
+    SERVER_PID=$!
+    echo "SERVER_PID=$SERVER_PID" >> "$GITHUB_ENV"
+    
+    # Wait briefly and check if server is still running
+    sleep 2
+    if ! kill -0 $SERVER_PID 2>/dev/null; then
+      echo "Uvicorn failed to start. Output:"
+      cat crawler.log
+      exit 1
+    fi
+    
+    # Health check with retries
+    for i in {1..30}; do
+      if curl -s http://127.0.0.1:8000/docs > /dev/null; then
+        echo "Server is ready!"
+        exit 0
+      fi
+      echo "Waiting for server... ($i/30)"
+      sleep 1
+    done
+    
+    echo "Server did not become ready."
+    cat crawler.log
+    exit 1
 
       - name: Start crawl
         env:
