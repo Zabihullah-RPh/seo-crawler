@@ -1,6 +1,8 @@
-﻿name: SEO Crawler
+name: SEO Crawler
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       url:
@@ -34,8 +36,8 @@ jobs:
 
       - name: Start crawler and run crawl
         env:
-          TARGET_URL: ${{ github.event.inputs.url }}
-          MAX_PAGES: ${{ github.event.inputs.max_pages }}
+          TARGET_URL: ${{ github.event.inputs.url || 'https://weeklypakistan.com.pk/' }}
+          MAX_PAGES: ${{ github.event.inputs.max_pages || '10' }}
         run: |
           python -m uvicorn app.api:app --host 127.0.0.1 --port 8000 > crawler.log 2>&1 &
           SERVER_PID=$!
@@ -64,7 +66,7 @@ jobs:
             exit 1
           fi
 
-          echo "Starting crawl..."
+          echo "Starting crawl of $TARGET_URL with max pages $MAX_PAGES..."
 
           python -c "import os,requests; r=requests.post('http://127.0.0.1:8000/crawl',json={'url':os.environ['TARGET_URL'],'max_pages':int(os.environ['MAX_PAGES'])}); print(r.text); open('crawl_response.txt','w').write(r.text); r.raise_for_status()"
 
@@ -114,6 +116,3 @@ jobs:
             crawl_response.txt
             crawler.log
           if-no-files-found: warn
-
-
-
