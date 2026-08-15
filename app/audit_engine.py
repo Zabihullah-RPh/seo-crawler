@@ -177,12 +177,30 @@ def analyze(data):
             "score": round(page_scores[index]) if page_scores else 0,
         })
 
+    pages_crawled = len(pages)
+    try:
+        pages_discovered = int(data.get("site", {}).get("pages_discovered", pages_crawled) or pages_crawled)
+    except (TypeError, ValueError):
+        pages_discovered = pages_crawled
+    pages_discovered = max(pages_discovered, pages_crawled)
+
+    # Crawl coverage is intentionally displayed as a simple 10-point grade.
+    # 98-100% = 10/10 green, 95-97.99% = 9/10 orange, <95% = 7/10 red.
+    coverage = (pages_crawled / pages_discovered * 100) if pages_discovered else 0
+    if coverage >= 98:
+        crawl_coverage_score = 10
+    elif coverage >= 95:
+        crawl_coverage_score = 9
+    else:
+        crawl_coverage_score = 7
+
     return {
         "summary": {
             "seo_score": seo_score,
             "site_health": site_health,
-            "pages_crawled": len(pages),
-            "pages_discovered": data.get("site", {}).get("pages_discovered", len(pages)),
+            "pages_crawled": pages_crawled,
+            "pages_discovered": pages_discovered,
+            "crawl_coverage_score": crawl_coverage_score,
             "critical": counts["critical"],
             "high": counts["high"],
             "medium": counts["medium"],
@@ -202,6 +220,14 @@ def _score_class(score):
     if score < 90:
         return "score-orange"
     return "score-green"
+
+
+def _crawl_coverage_class(score):
+    if score == 10:
+        return "score-green"
+    if score == 9:
+        return "score-orange"
+    return "score-red"
 
 
 def html_report(audit_data, crawl_data):
@@ -228,7 +254,7 @@ def html_report(audit_data, crawl_data):
     site_lines = f"<p><b>Platform:</b> {escape(platform)}</p><p><b>Tracking / Pixels / Tags:</b> {escape(tracking)}</p><p><b>Average DOM Load:</b> {site.get('average_dom_loaded_seconds', 0)} seconds</p><p><b>Average Fully Loaded:</b> {site.get('average_fully_loaded_seconds', 0)} seconds</p><p><b>Domain:</b> {escape(domain.get('hostname', ''))}</p><p><b>Domain Created:</b> {escape(str((domain.get('domain_age') or {}).get('created', 'Not detected')))}</p><p><b>IP:</b> {escape(', '.join(domain.get('ip_addresses', [])) or 'Not detected')}</p><p><b>Server:</b> {escape(str(domain.get('server') or 'Not disclosed'))}</p><p><b>SSL:</b> {escape('Enabled' if ssl.get('enabled') else 'Not verified')}</p>"
     return f'''<!doctype html><html><head><meta charset="utf-8"><title>SEO Audit Report - Crawl {crawl_data.get('crawl_id')}</title><style>
 body{{font-family:Arial,sans-serif;background:#f4f5f7;color:#222;margin:0;padding:35px}}.container{{max-width:1400px;margin:auto;background:#fff;padding:35px}}.metrics{{display:flex;gap:20px;margin:25px 0}}.metric{{flex:1;border:1px solid #ddd;padding:20px;border-radius:8px}}.metric strong{{display:block;font-size:30px;margin-top:8px}}.score-red{{color:#dc2626!important}}.score-orange{{color:#d97706!important}}.score-green{{color:#16a34a!important}}.pages-blue{{color:#2563eb!important}}.site{{border:1px solid #ddd;padding:20px;margin-bottom:30px}}table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{border:1px solid #ddd;padding:12px;text-align:left;vertical-align:top}}th{{background:#eee}}a{{color:#2563eb;text-decoration:underline}}a:hover{{text-decoration:none}}.legend{{font-size:13px;color:#666;margin-top:8px}}
-</style></head><body><div class="container"><h1>SEO Audit Report</h1><p>Crawl ID: {crawl_data.get('crawl_id')}</p><div class="metrics"><div class="metric">SEO Score<strong class="{_score_class(s['seo_score'])}">{s['seo_score']}/100</strong></div><div class="metric">Site Health<strong class="{_score_class(s['site_health'])}">{s['site_health']}/100</strong></div><div class="metric">Pages Crawled<strong class="pages-blue">{s['pages_crawled']}</strong></div></div><div class="site"><h2>Site-Wide Information</h2>{site_lines}</div><h2>Issues by Page</h2><table><tr><th>Page</th><th>Problems / Opportunities</th></tr>{''.join(rows)}</table></div></body></html>'''
+</style></head><body><div class="container"><h1>SEO Audit Report</h1><p>Crawl ID: {crawl_data.get('crawl_id')}</p><div class="metrics"><div class="metric">SEO Score<strong class="{_score_class(s['seo_score'])}">{s['seo_score']}/100</strong></div><div class="metric">Site Health<strong class="{_score_class(s['site_health'])}">{s['site_health']}/100</strong></div><div class="metric">Pages Crawled<strong class="{_crawl_coverage_class(s['crawl_coverage_score'])}">{s['crawl_coverage_score']}/10</strong></div></div><div class="site"><h2>Site-Wide Information</h2>{site_lines}</div><h2>Issues by Page</h2><table><tr><th>Page</th><th>Problems / Opportunities</th></tr>{''.join(rows)}</table></div></body></html>'''
 
 
 def generate_report(data, source_path):
