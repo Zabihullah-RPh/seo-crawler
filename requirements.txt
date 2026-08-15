@@ -10,3 +10,5 @@ orjson>=3.11
 xxhash>=3.5
 selectolax>=0.3.33
 requests>=2.32
+
+playwright>=1.40.0

@@ -29,7 +29,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install requests
+          pip install requests`n          python -m playwright install --with-deps chromium
 
       - name: Start crawler and run crawl
         env:
@@ -113,3 +113,4 @@ jobs:
             crawl_response.txt
             crawler.log
           if-no-files-found: warn
+
