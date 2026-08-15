@@ -3,8 +3,6 @@ name: SEO Crawler
 on:
   push:
     branches: [main]
-  issues:
-    types: [opened]
   workflow_dispatch:
     inputs:
       url:
@@ -18,7 +16,6 @@ on:
 
 jobs:
   crawl:
-    if: github.event_name != 'issues' || startsWith(github.event.issue.title, 'SEO CRAWL:')
     runs-on: ubuntu-latest
 
     steps:
@@ -39,10 +36,26 @@ jobs:
 
       - name: Start crawler and run crawl
         env:
-          TARGET_URL: ${{ github.event_name == 'issues' && github.event.issue.body || github.event.inputs.url || 'https://weeklypakistan.com.pk/' }}
-          MAX_PAGES: ${{ github.event_name == 'issues' && '10' || github.event.inputs.max_pages || '10' }}
+          DISPATCH_URL: ${{ github.event.inputs.url }}
+          DISPATCH_MAX_PAGES: ${{ github.event.inputs.max_pages }}
         run: |
-          TARGET_URL=$(printf '%s' "$TARGET_URL" | tr -d '\r\n' | xargs)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TARGET_URL="$DISPATCH_URL"
+            MAX_PAGES="${DISPATCH_MAX_PAGES:-10}"
+          else
+            if [ ! -f crawl-request.txt ]; then
+              echo "crawl-request.txt is missing."
+              exit 1
+            fi
+            TARGET_URL=$(head -n 1 crawl-request.txt | tr -d '\r\n' | xargs)
+            MAX_PAGES=10
+          fi
+
+          if [ -z "$TARGET_URL" ]; then
+            echo "Target URL is empty."
+            exit 1
+          fi
+
           echo "Target URL: $TARGET_URL"
           echo "Maximum pages: $MAX_PAGES"
 
@@ -75,7 +88,7 @@ jobs:
 
           echo "Starting crawl of $TARGET_URL with max pages $MAX_PAGES..."
 
-          python -c "import os,requests; r=requests.post('http://127.0.0.1:8000/crawl',json={'url':os.environ['TARGET_URL'],'max_pages':int(os.environ['MAX_PAGES'])}); print(r.text); open('crawl_response.txt','w').write(r.text); r.raise_for_status()"
+          TARGET_URL="$TARGET_URL" MAX_PAGES="$MAX_PAGES" python -c "import os,requests; r=requests.post('http://127.0.0.1:8000/crawl',json={'url':os.environ['TARGET_URL'],'max_pages':int(os.environ['MAX_PAGES'])}); print(r.text); open('crawl_response.txt','w').write(r.text); r.raise_for_status()"
 
           CRAWL_ID=$(python -c "import json; print(json.load(open('crawl_response.txt'))['crawl_id'])")
 
