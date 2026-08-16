@@ -119,6 +119,17 @@ jobs:
             exit 1
           fi
 
+      - name: Run isolated Common Crawl backlink collection
+        if: success()
+        env:
+          TARGET_URL: ${{ github.event.inputs.url }}
+        run: |
+          if [ -z "$TARGET_URL" ]; then
+            TARGET_URL=$(head -n 1 crawl-request.txt | tr -d '\r\n' | xargs)
+          fi
+          echo "Collecting Common Crawl backlink data for $TARGET_URL"
+          python -c "import json,os; from app.integrations.common_crawl_runtime import collect; u=os.environ['TARGET_URL']; r=collect(u); print(json.dumps(r,indent=2)); open('backlinks.json','w',encoding='utf-8').write(json.dumps(r,indent=2))"
+
       - name: Show crawler log
         if: always()
         run: |
@@ -135,4 +146,5 @@ jobs:
             results/
             crawl_response.txt
             crawler.log
+            backlinks.json
           if-no-files-found: warn
