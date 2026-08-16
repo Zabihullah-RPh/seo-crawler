@@ -55,7 +55,6 @@ def _reverse_domain(domain: str) -> str:
 
 
 def _latest_graph_release() -> str:
-    last_error = None
     for attempt in range(1, 6):
         try:
             response = requests.get(GRAPHINFO_URL, timeout=30)
@@ -68,9 +67,8 @@ def _latest_graph_release() -> str:
                 raise RuntimeError("Common Crawl graphinfo.json did not contain a release id.")
             return release
         except Exception as exc:
-            last_error = exc
             print(f"[COMMON CRAWL] graphinfo attempt {attempt}/5 failed: {exc}")
-    print(f"[COMMON CRAWL] Using known latest release fallback: {FALLBACK_RELEASE}")
+    print(f"[COMMON CRAWL] Using known release fallback: {FALLBACK_RELEASE}")
     return FALLBACK_RELEASE
 
 
@@ -149,6 +147,13 @@ def _ensure_offsets(graph_base: Path, jar: Path) -> None:
 
 
 def _incoming_node_ids(graph_base: Path, node_id: int, jar: Path) -> list[int]:
+    """Read one node's incoming neighbors from the mapped transpose graph.
+
+    Common Crawl's own explorer uses ImmutableGraph.loadMapped() for large
+    webgraphs. That avoids trying to materialize the entire multi-gigabyte
+    graph in the Java heap, which is what caused the previous GraphLookup
+    process to exit with code 1.
+    """
     helper = graph_base.parent / "GraphLookup.java"
     helper.write_text(
         """
@@ -157,7 +162,7 @@ import it.unimi.dsi.webgraph.LazyIntIterator;
 
 public class GraphLookup {
   public static void main(String[] args) throws Exception {
-    ImmutableGraph g = ImmutableGraph.load(args[0]);
+    ImmutableGraph g = ImmutableGraph.loadMapped(args[0]);
     int node = Integer.parseInt(args[1]);
     LazyIntIterator it = g.successors(node);
     int degree = g.outdegree(node);
@@ -169,7 +174,7 @@ public class GraphLookup {
     )
     subprocess.run(["javac", "-cp", str(jar), str(helper)], check=True)
     proc = subprocess.run(
-        ["java", "-Xmx5g", "-cp", f"{jar}:{helper.parent}", "GraphLookup", str(graph_base), str(node_id)],
+        ["java", "-Xmx2g", "-cp", f"{jar}:{helper.parent}", "GraphLookup", str(graph_base), str(node_id)],
         check=True,
         capture_output=True,
         text=True,
@@ -191,14 +196,12 @@ def query_commoncrawl_backlinks(url: str) -> dict[str, Any]:
     base = f"{GRAPH_BASE_URL}/{release}/domain"
     vertices_name = f"{release}-domain-vertices.txt.gz"
     transpose_name = f"{release}-domain-t.graph"
-    properties_name = f"{release}-domain-t.properties"
 
     try:
         with tempfile.TemporaryDirectory(prefix="cc-backlinks-") as temp_dir:
             temp = Path(temp_dir)
             vertices = temp / vertices_name
             transpose = temp / transpose_name
-            properties = temp / properties_name
 
             print(f"[COMMON CRAWL] Release: {release}")
             print(f"[COMMON CRAWL] Target domain: {domain}")
@@ -215,7 +218,6 @@ def query_commoncrawl_backlinks(url: str) -> dict[str, Any]:
             print(f"[COMMON CRAWL] Target node id: {node_id}")
             print("[COMMON CRAWL] Fetching transpose graph for incoming domain links...")
             _download(f"{base}/{transpose_name}", transpose)
-            _download(f"{base}/{properties_name}", properties, max_seconds=300)
 
             jar = _ensure_webgraph_package(temp)
             graph_base = transpose.with_suffix("")
@@ -248,7 +250,7 @@ def query_commoncrawl_backlinks(url: str) -> dict[str, Any]:
                 backlinks=backlinks,
                 message=(
                     "Common Crawl domain-level incoming links collected successfully. "
-                    "Anchor text, rel attributes, and source page URLs require the separate page-level WARC enrichment phase."
+                    "Anchor text, rel attributes, and exact source pages require the page-level WARC enrichment phase."
                 ),
             ).as_dict()
 
