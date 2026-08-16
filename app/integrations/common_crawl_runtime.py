@@ -135,6 +135,48 @@ def ensure_runtime_jars() -> Path:
     return cache
 
 
+def ensure_offsets(graph_file: Path, jar_dir: Path) -> Path:
+    """Create the BVGraph random-access offset file once, locally.
+
+    Common Crawl publishes the .graph and .properties files, but the WebGraph
+    random-access API also needs the .offsets file. We generate it locally from
+    the already-downloaded graph and cache it next to the graph. This is a
+    one-time preprocessing step for each graph release.
+    """
+    offsets = Path(f"{graph_file}.offsets")
+    if offsets.exists() and offsets.stat().st_size > 0:
+        return offsets
+
+    jars = sorted(jar_dir.glob("*.jar"))
+    if not jars:
+        raise RuntimeError("WebGraph runtime libraries are unavailable.")
+
+    classpath = os.pathsep.join(str(path) for path in jars)
+    xmx = os.environ.get("COMMON_CRAWL_JAVA_XMX", "4g")
+    print(f"[COMMON CRAWL] generating missing offset file: {offsets.name}")
+    print(f"[COMMON CRAWL] this is a one-time local preprocessing step for this graph release (JVM heap: {xmx})")
+
+    process = subprocess.run(
+        [
+            "java",
+            f"-Xmx{xmx}",
+            "-cp",
+            classpath,
+            "it.unimi.dsi.webgraph.BVGraph",
+            "-O",
+            "-L",
+            str(graph_file.with_suffix("")),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if not offsets.exists() or offsets.stat().st_size == 0:
+        detail = (process.stderr or process.stdout or "WebGraph did not create the offsets file.").strip()
+        raise RuntimeError(detail)
+    return offsets
+
+
 def incoming_ids(graph_file: Path, node_id: int, jar_dir: Path) -> set[int]:
     helper_dir = Path(tempfile.mkdtemp(prefix="cc-java-"))
     helper = helper_dir / "BacklinkLookup.java"
@@ -162,6 +204,7 @@ public class BacklinkLookup {
         raise RuntimeError("WebGraph runtime libraries are unavailable.")
     classpath = os.pathsep.join(str(path) for path in jars)
     try:
+        ensure_offsets(graph_file, jar_dir)
         subprocess.run(["javac", "-cp", classpath, str(helper)], check=True, capture_output=True, text=True)
         run_cp = os.pathsep.join([classpath, str(helper_dir)])
         process = subprocess.run(
