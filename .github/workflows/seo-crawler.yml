@@ -38,6 +38,9 @@ jobs:
         env:
           DISPATCH_URL: ${{ github.event.inputs.url }}
           DISPATCH_MAX_PAGES: ${{ github.event.inputs.max_pages }}
+          BACKLINK_PROVIDER: ${{ vars.BACKLINK_PROVIDER || 'none' }}
+          BACKLINK_API_URL: ${{ vars.BACKLINK_API_URL || '' }}
+          BACKLINK_API_KEY: ${{ secrets.BACKLINK_API_KEY || '' }}
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TARGET_URL="$DISPATCH_URL"
@@ -118,6 +121,9 @@ jobs:
             cat crawler.log
             exit 1
           fi
+
+          echo "Running runtime backlink enrichment..."
+          BACKLINK_PROVIDER="$BACKLINK_PROVIDER" BACKLINK_API_URL="$BACKLINK_API_URL" BACKLINK_API_KEY="$BACKLINK_API_KEY" python -m app.integrations.backlink_report "results/crawl_${CRAWL_ID}.json"
 
       - name: Show crawler log
         if: always()
