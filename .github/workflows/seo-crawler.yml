@@ -19,6 +19,7 @@ on:
 jobs:
   crawl:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
 
     steps:
       - name: Checkout
@@ -35,6 +36,10 @@ jobs:
           pip install -r requirements.txt
           pip install requests
           python -m playwright install --with-deps chromium
+
+      - name: Show runner disk space
+        run: |
+          df -h
 
       - name: Start crawler and run crawl
         env:
