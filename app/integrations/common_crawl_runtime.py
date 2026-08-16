@@ -22,11 +22,13 @@ FALLBACK_RELEASE = "cc-main-2026-may-jun-jul"
 MAVEN_BASE = "https://repo1.maven.org/maven2"
 WEBGRAPH_DEPS = {
     "webgraph-3.6.12.jar": "it/unimi/dsi/webgraph/3.6.12/webgraph-3.6.12.jar",
-    "fastutil-8.5.16.jar": "it/unimi/dsi/fastutil/8.5.16/fastutil-8.5.16.jar",
+    "fastutil-8.5.18.jar": "it/unimi/dsi/fastutil/8.5.18/fastutil-8.5.18.jar",
     "dsiutils-2.7.4.jar": "it/unimi/dsi/dsiutils/2.7.4/dsiutils-2.7.4.jar",
     "sux4j-5.4.1.jar": "it/unimi/dsi/sux4j/5.4.1/sux4j-5.4.1.jar",
     "jsap-20210129.jar": "it/unimi/di/jsap/20210129/jsap-20210129.jar",
-    "slf4j-api-2.0.3.jar": "org/slf4j/slf4j-api/2.0.3/slf4j-api-2.0.3.jar",
+    "slf4j-api-2.0.18.jar": "org/slf4j/slf4j-api/2.0.18/slf4j-api-2.0.18.jar",
+    "slf4j-simple-2.0.18.jar": "org/slf4j/slf4j-simple/2.0.18/slf4j-simple-2.0.18.jar",
+    "commons-math3-3.6.1.jar": "org/apache/commons/commons-math3/3.6.1/commons-math3-3.6.1.jar",
 }
 
 
@@ -136,13 +138,7 @@ def ensure_runtime_jars() -> Path:
 
 
 def ensure_offsets(graph_file: Path, jar_dir: Path) -> Path:
-    """Create the BVGraph random-access offset file once, locally.
-
-    Common Crawl publishes the .graph and .properties files, but the WebGraph
-    random-access API also needs the .offsets file. We generate it locally from
-    the already-downloaded graph and cache it next to the graph. This is a
-    one-time preprocessing step for each graph release.
-    """
+    """Create the BVGraph random-access offset file once, locally."""
     offsets = Path(f"{graph_file}.offsets")
     if offsets.exists() and offsets.stat().st_size > 0:
         return offsets
