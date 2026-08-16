@@ -3,6 +3,8 @@ name: SEO Crawler
 on:
   push:
     branches: [main]
+    paths:
+      - "crawl-request.txt"
   workflow_dispatch:
     inputs:
       url:
