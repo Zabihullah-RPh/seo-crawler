@@ -1,7 +1,8 @@
-"""Isolated Common Crawl backlink collector.
+"""Local Common Crawl Layer 1 backlink discovery.
 
-This module is intentionally independent from the SEO audit engine. It performs
-runtime-only Common Crawl domain-level backlink discovery for the supplied URL.
+The SEO audit engine is intentionally untouched. This module uses a locally
+stored Common Crawl domain transpose graph to discover referring domains for
+any target URL. It never downloads Common Crawl graph data at audit time.
 """
 from __future__ import annotations
 
@@ -15,8 +16,18 @@ from urllib.parse import urlparse
 import requests
 
 GRAPHINFO_URL = "https://index.commoncrawl.org/graphinfo.json"
-GRAPH_BASE = "https://data.commoncrawl.org/projects/hyperlinkgraph"
 FALLBACK_RELEASE = "cc-main-2026-may-jun-jul"
+
+# WebGraph runtime dependencies. They are small and cached locally; Maven is not required.
+MAVEN_BASE = "https://repo1.maven.org/maven2"
+WEBGRAPH_DEPS = {
+    "webgraph-3.6.12.jar": "it/unimi/dsi/webgraph/3.6.12/webgraph-3.6.12.jar",
+    "fastutil-8.5.16.jar": "it/unimi/dsi/fastutil/8.5.16/fastutil-8.5.16.jar",
+    "dsiutils-2.7.4.jar": "it/unimi/dsi/dsiutils/2.7.4/dsiutils-2.7.4.jar",
+    "sux4j-5.4.1.jar": "it/unimi/dsi/sux4j/5.4.1/sux4j-5.4.1.jar",
+    "jsap-20210129.jar": "it/unimi/di/jsap/20210129/jsap-20210129.jar",
+    "slf4j-api-2.0.3.jar": "org/slf4j/slf4j-api/2.0.3/slf4j-api-2.0.3.jar",
+}
 
 
 def target_domain(url: str) -> str:
@@ -29,34 +40,42 @@ def reverse_domain(domain: str) -> str:
 
 
 def latest_release() -> str:
-    for _ in range(5):
-        try:
-            response = requests.get(GRAPHINFO_URL, timeout=30)
-            response.raise_for_status()
-            payload = response.json()
-            if isinstance(payload, list) and payload:
-                release = str(payload[0].get("id") or "").strip()
-                if release:
-                    return release
-        except Exception as exc:
-            print(f"[COMMON CRAWL] graphinfo retry failed: {exc}")
+    try:
+        response = requests.get(GRAPHINFO_URL, timeout=20)
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, list) and payload:
+            release = str(payload[0].get("id") or "").strip()
+            if release:
+                return release
+    except Exception as exc:
+        print(f"[COMMON CRAWL] graphinfo unavailable: {exc}")
     return FALLBACK_RELEASE
 
 
-def download(url: str, destination: Path, timeout: int = 7200) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() and destination.stat().st_size > 0:
-        return
-    part = destination.with_suffix(destination.suffix + ".part")
-    subprocess.run(
-        [
-            "curl", "-fL", "--retry", "8", "--retry-all-errors", "--retry-delay", "5",
-            "--connect-timeout", "30", "--max-time", str(timeout),
-            "-o", str(part), url,
-        ],
-        check=True,
-    )
-    part.replace(destination)
+def local_graph_dir() -> Path | None:
+    configured = os.environ.get("COMMON_CRAWL_GRAPH_DIR", "").strip()
+    candidates = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    if os.name == "nt":
+        candidates.append(Path(r"C:\commoncrawl"))
+    candidates.append(Path.cwd() / "commoncrawl")
+
+    for path in candidates:
+        if path.exists() and path.is_dir():
+            return path
+    return None
+
+
+def graph_files(root: Path, release: str) -> tuple[Path, Path, Path] | None:
+    stem = root / f"{release}-domain-t"
+    graph = stem.with_suffix(".graph")
+    properties = stem.with_suffix(".properties")
+    vertices = root / f"{release}-domain-vertices.txt.gz"
+    if graph.exists() and properties.exists() and vertices.exists():
+        return graph, properties, vertices
+    return None
 
 
 def find_domain_id(vertices: Path, domain: str) -> int | None:
@@ -67,7 +86,10 @@ def find_domain_id(vertices: Path, domain: str) -> int | None:
                 continue
             parts = line.rstrip("\n").split("\t")
             if len(parts) >= 2 and parts[1].strip().lower() == wanted:
-                return int(parts[0])
+                try:
+                    return int(parts[0])
+                except ValueError:
+                    return None
     return None
 
 
@@ -94,23 +116,28 @@ def map_domain_ids(vertices: Path, ids: set[int]) -> dict[int, str]:
     return found
 
 
-def build_webgraph_jar(temp: Path) -> Path:
-    repo = temp / "cc-webgraph"
-    jar = repo / "target" / "cc-webgraph-0.1-SNAPSHOT-jar-with-dependencies.jar"
-    if jar.exists():
-        return jar
-    subprocess.run(
-        ["git", "clone", "--depth", "1", "https://github.com/commoncrawl/cc-webgraph.git", str(repo)],
-        check=True,
-    )
-    subprocess.run(["mvn", "-q", "-DskipTests", "package"], cwd=repo, check=True)
-    return jar
+def ensure_runtime_jars() -> Path:
+    cache = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "seo-crawler" / "commoncrawl-jars"
+    cache.mkdir(parents=True, exist_ok=True)
+
+    for filename, relative_url in WEBGRAPH_DEPS.items():
+        destination = cache / filename
+        if destination.exists() and destination.stat().st_size > 0:
+            continue
+        url = f"{MAVEN_BASE}/{relative_url}"
+        print(f"[COMMON CRAWL] downloading runtime dependency: {filename}")
+        response = requests.get(url, timeout=120)
+        response.raise_for_status()
+        part = destination.with_suffix(destination.suffix + ".part")
+        part.write_bytes(response.content)
+        part.replace(destination)
+
+    return cache
 
 
-def incoming_ids(graph_base: Path, node_id: int, jar: Path, temp: Path) -> set[int]:
-    # BVGraph uses a companion .offsets file for random access. The previous
-    # implementation omitted this file, causing loadMapped() to fail at runtime.
-    helper = temp / "BacklinkLookup.java"
+def incoming_ids(graph_file: Path, node_id: int, jar_dir: Path) -> set[int]:
+    helper_dir = Path(tempfile.mkdtemp(prefix="cc-java-"))
+    helper = helper_dir / "BacklinkLookup.java"
     helper.write_text(
         """
 import it.unimi.dsi.webgraph.ImmutableGraph;
@@ -121,114 +148,139 @@ public class BacklinkLookup {
     ImmutableGraph graph = ImmutableGraph.loadMapped(args[0]);
     int node = Integer.parseInt(args[1]);
     LazyIntIterator it = graph.successors(node);
-    int n = graph.outdegree(node);
-    for (int i = 0; i < n; i++) System.out.println(it.nextInt());
+    int count = graph.outdegree(node);
+    for (int i = 0; i < count; i++) {
+      System.out.println(it.nextInt());
+    }
   }
 }
 """,
         encoding="utf-8",
     )
-    subprocess.run(["javac", "-cp", str(jar), str(helper)], check=True)
-    cp = f"{jar}{os.pathsep}{temp}"
-    proc = subprocess.run(
-        ["java", "-cp", cp, "BacklinkLookup", str(graph_base), str(node_id)],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return {int(x.strip()) for x in proc.stdout.splitlines() if x.strip().isdigit()}
+    jars = sorted(jar_dir.glob("*.jar"))
+    if not jars:
+        raise RuntimeError("WebGraph runtime libraries are unavailable.")
+    classpath = os.pathsep.join(str(path) for path in jars)
+    try:
+        subprocess.run(["javac", "-cp", classpath, str(helper)], check=True, capture_output=True, text=True)
+        run_cp = os.pathsep.join([classpath, str(helper_dir)])
+        process = subprocess.run(
+            ["java", "-cp", run_cp, "BacklinkLookup", str(graph_file.with_suffix("")), str(node_id)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return {int(x.strip()) for x in process.stdout.splitlines() if x.strip().isdigit()}
+    finally:
+        for path in helper_dir.glob("*"):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        try:
+            helper_dir.rmdir()
+        except OSError:
+            pass
 
 
 def collect(url: str) -> dict:
     domain = target_domain(url)
+    base = {
+        "provider": "Common Crawl",
+        "target_domain": domain,
+        "graph_level": "domain",
+    }
     if not domain:
+        return {**base, "status": "invalid_target", "total_backlinks": 0, "referring_domains": 0, "backlinks": []}
+
+    root = local_graph_dir()
+    if root is None:
         return {
-            "provider": "Common Crawl",
-            "status": "invalid_target",
-            "target_domain": domain,
+            **base,
+            "status": "not_configured",
             "total_backlinks": 0,
             "referring_domains": 0,
             "backlinks": [],
+            "message": "Local Common Crawl graph directory was not found. Set COMMON_CRAWL_GRAPH_DIR or use C:\\commoncrawl.",
         }
 
     release = latest_release()
-    base = f"{GRAPH_BASE}/{release}/domain"
-    vertices_name = f"{release}-domain-vertices.txt.gz"
-    graph_name = f"{release}-domain-t.graph"
-    properties_name = f"{release}-domain-t.properties"
-    offsets_name = f"{release}-domain-t.offsets"
-
-    try:
-        with tempfile.TemporaryDirectory(prefix="cc-runtime-") as work:
-            temp = Path(work)
-            vertices = temp / vertices_name
-            graph = temp / graph_name
-            properties = temp / properties_name
-            offsets = temp / offsets_name
-
-            print(f"[COMMON CRAWL] release={release} domain={domain}")
-            download(f"{base}/{vertices_name}", vertices, timeout=3600)
-            node_id = find_domain_id(vertices, domain)
-            if node_id is None:
-                return {
-                    "provider": "Common Crawl",
-                    "status": "not_in_graph",
-                    "target_domain": domain,
-                    "graph_release": release,
-                    "total_backlinks": 0,
-                    "referring_domains": 0,
-                    "backlinks": [],
-                    "message": "Target domain is not present in the current Common Crawl domain graph.",
-                }
-
-            print(f"[COMMON CRAWL] target_node={node_id}")
-            download(f"{base}/{graph_name}", graph, timeout=10800)
-            download(f"{base}/{properties_name}", properties, timeout=300)
-            download(f"{base}/{offsets_name}", offsets, timeout=3600)
-
-            jar = build_webgraph_jar(temp)
-            ids = incoming_ids(graph.with_suffix(""), node_id, jar, temp)
-            domains = map_domain_ids(vertices, ids)
-            links = [
-                {
-                    "source_url": f"https://{domains[i]}/",
-                    "target_url": f"https://{domain}/",
-                    "anchor_text": "",
-                    "rel": "",
-                    "referring_domain": domains[i],
-                    "graph_level": "domain",
-                    "graph_release": release,
-                }
-                for i in sorted(ids)
-                if i in domains
-            ]
-
-            return {
-                "provider": "Common Crawl",
-                "status": "success",
-                "target_domain": domain,
-                "graph_release": release,
-                "total_backlinks": len(links),
-                "referring_domains": len(domains),
-                "backlinks": links,
-                "message": "Domain-level incoming links discovered from Common Crawl. Page-level URL, anchor and rel enrichment remains separate.",
-            }
-    except requests.RequestException as exc:
+    files = graph_files(root, release)
+    if files is None:
         return {
-            "provider": "Common Crawl",
-            "status": "request_failed",
-            "target_domain": domain,
+            **base,
+            "status": "graph_missing",
             "graph_release": release,
             "total_backlinks": 0,
             "referring_domains": 0,
             "backlinks": [],
-            "message": str(exc),
+            "message": f"Local graph files for {release} were not found in {root}.",
+        }
+
+    graph, _properties, vertices = files
+    try:
+        node_id = find_domain_id(vertices, domain)
+        if node_id is None:
+            return {
+                **base,
+                "status": "not_in_graph",
+                "graph_release": release,
+                "total_backlinks": 0,
+                "referring_domains": 0,
+                "backlinks": [],
+                "message": "Target domain is not present in the current Common Crawl domain graph.",
+            }
+
+        jar_dir = ensure_runtime_jars()
+        incoming = incoming_ids(graph, node_id, jar_dir)
+        domains = map_domain_ids(vertices, incoming)
+        links = [
+            {
+                "source_url": f"https://{domains[node]}/",
+                "target_url": f"https://{domain}/",
+                "anchor_text": "",
+                "rel": "",
+                "referring_domain": domains[node],
+                "graph_level": "domain",
+                "graph_release": release,
+            }
+            for node in sorted(incoming)
+            if node in domains
+        ]
+        return {
+            **base,
+            "status": "success",
+            "graph_release": release,
+            "total_backlinks": len(links),
+            "referring_domains": len(domains),
+            "backlinks": links,
+            "message": "Domain-level incoming links discovered from the local Common Crawl graph. Exact page/anchor/rel details belong to Layer 2.",
+        }
+    except FileNotFoundError as exc:
+        return {
+            **base,
+            "status": "java_not_configured",
+            "graph_release": release,
+            "total_backlinks": 0,
+            "referring_domains": 0,
+            "backlinks": [],
+            "message": f"Java is required for the local WebGraph lookup: {exc}",
         }
     except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
         return {
-            "provider": "Common Crawl",
+            **base,
             "status": "processing_failed",
-            "target_domain": domain,
+            "graph_release": release,
+            "total_backlinks": 0,
+            "referring_domains": 0,
+            "backlinks": [],
+            "message": detail,
+        }
+    except requests.RequestException as exc:
+        return {
+            **base,
+            "status": "dependency_download_failed",
             "graph_release": release,
             "total_backlinks": 0,
             "referring_domains": 0,
@@ -237,9 +289,8 @@ def collect(url: str) -> dict:
         }
     except Exception as exc:
         return {
-            "provider": "Common Crawl",
+            **base,
             "status": "failed",
-            "target_domain": domain,
             "graph_release": release,
             "total_backlinks": 0,
             "referring_domains": 0,
