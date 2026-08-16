@@ -1,8 +1,7 @@
 """Isolated Common Crawl backlink collector.
 
-The collector is deliberately independent from the SEO audit engine. It runs only
-for the domain supplied at crawl time and writes a separate backlink JSON file.
-It does not modify the existing crawl/audit data structures.
+This module is intentionally independent from the SEO audit engine. It performs
+runtime-only Common Crawl domain-level backlink discovery for the supplied URL.
 """
 from __future__ import annotations
 
@@ -30,28 +29,33 @@ def reverse_domain(domain: str) -> str:
 
 
 def latest_release() -> str:
-    try:
-        r = requests.get(GRAPHINFO_URL, timeout=30)
-        r.raise_for_status()
-        payload = r.json()
-        if isinstance(payload, list) and payload:
-            release = str(payload[0].get("id") or "").strip()
-            if release:
-                return release
-    except Exception as exc:
-        print(f"[COMMON CRAWL] graphinfo unavailable: {exc}")
+    for _ in range(5):
+        try:
+            response = requests.get(GRAPHINFO_URL, timeout=30)
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, list) and payload:
+                release = str(payload[0].get("id") or "").strip()
+                if release:
+                    return release
+        except Exception as exc:
+            print(f"[COMMON CRAWL] graphinfo retry failed: {exc}")
     return FALLBACK_RELEASE
 
 
 def download(url: str, destination: Path, timeout: int = 7200) -> None:
-    part = destination.with_suffix(destination.suffix + ".part")
+    destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() and destination.stat().st_size > 0:
         return
-    cmd = [
-        "curl", "-fL", "--retry", "8", "--retry-all-errors", "--retry-delay", "5",
-        "--connect-timeout", "30", "--max-time", str(timeout), "-o", str(part), url,
-    ]
-    subprocess.run(cmd, check=True)
+    part = destination.with_suffix(destination.suffix + ".part")
+    subprocess.run(
+        [
+            "curl", "-fL", "--retry", "8", "--retry-all-errors", "--retry-delay", "5",
+            "--connect-timeout", "30", "--max-time", str(timeout),
+            "-o", str(part), url,
+        ],
+        check=True,
+    )
     part.replace(destination)
 
 
@@ -95,18 +99,23 @@ def build_webgraph_jar(temp: Path) -> Path:
     jar = repo / "target" / "cc-webgraph-0.1-SNAPSHOT-jar-with-dependencies.jar"
     if jar.exists():
         return jar
-    subprocess.run(["git", "clone", "--depth", "1", "https://github.com/commoncrawl/cc-webgraph.git", str(repo)], check=True)
+    subprocess.run(
+        ["git", "clone", "--depth", "1", "https://github.com/commoncrawl/cc-webgraph.git", str(repo)],
+        check=True,
+    )
     subprocess.run(["mvn", "-q", "-DskipTests", "package"], cwd=repo, check=True)
     return jar
 
 
 def incoming_ids(graph_base: Path, node_id: int, jar: Path, temp: Path) -> set[int]:
-    # Common Crawl publishes a transpose graph; its successors(node) are the incoming nodes.
+    # BVGraph uses a companion .offsets file for random access. The previous
+    # implementation omitted this file, causing loadMapped() to fail at runtime.
     helper = temp / "BacklinkLookup.java"
     helper.write_text(
         """
 import it.unimi.dsi.webgraph.ImmutableGraph;
 import it.unimi.dsi.webgraph.LazyIntIterator;
+
 public class BacklinkLookup {
   public static void main(String[] args) throws Exception {
     ImmutableGraph graph = ImmutableGraph.loadMapped(args[0]);
@@ -121,23 +130,33 @@ public class BacklinkLookup {
     )
     subprocess.run(["javac", "-cp", str(jar), str(helper)], check=True)
     cp = f"{jar}{os.pathsep}{temp}"
-    result = subprocess.run(
-        ["java", "-Xmx6g", "-cp", cp, "BacklinkLookup", str(graph_base), str(node_id)],
-        capture_output=True, text=True, check=True,
+    proc = subprocess.run(
+        ["java", "-cp", cp, "BacklinkLookup", str(graph_base), str(node_id)],
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    return {int(x.strip()) for x in result.stdout.splitlines() if x.strip().isdigit()}
+    return {int(x.strip()) for x in proc.stdout.splitlines() if x.strip().isdigit()}
 
 
 def collect(url: str) -> dict:
     domain = target_domain(url)
     if not domain:
-        return {"provider": "Common Crawl", "status": "invalid_target", "target_domain": domain, "backlinks": []}
+        return {
+            "provider": "Common Crawl",
+            "status": "invalid_target",
+            "target_domain": domain,
+            "total_backlinks": 0,
+            "referring_domains": 0,
+            "backlinks": [],
+        }
 
     release = latest_release()
     base = f"{GRAPH_BASE}/{release}/domain"
     vertices_name = f"{release}-domain-vertices.txt.gz"
     graph_name = f"{release}-domain-t.graph"
     properties_name = f"{release}-domain-t.properties"
+    offsets_name = f"{release}-domain-t.offsets"
 
     try:
         with tempfile.TemporaryDirectory(prefix="cc-runtime-") as work:
@@ -145,23 +164,85 @@ def collect(url: str) -> dict:
             vertices = temp / vertices_name
             graph = temp / graph_name
             properties = temp / properties_name
+            offsets = temp / offsets_name
+
+            print(f"[COMMON CRAWL] release={release} domain={domain}")
             download(f"{base}/{vertices_name}", vertices, timeout=3600)
             node_id = find_domain_id(vertices, domain)
             if node_id is None:
-                return {"provider": "Common Crawl", "status": "not_in_graph", "target_domain": domain, "graph_release": release, "total_backlinks": 0, "referring_domains": 0, "backlinks": []}
+                return {
+                    "provider": "Common Crawl",
+                    "status": "not_in_graph",
+                    "target_domain": domain,
+                    "graph_release": release,
+                    "total_backlinks": 0,
+                    "referring_domains": 0,
+                    "backlinks": [],
+                    "message": "Target domain is not present in the current Common Crawl domain graph.",
+                }
+
+            print(f"[COMMON CRAWL] target_node={node_id}")
             download(f"{base}/{graph_name}", graph, timeout=10800)
             download(f"{base}/{properties_name}", properties, timeout=300)
+            download(f"{base}/{offsets_name}", offsets, timeout=3600)
+
             jar = build_webgraph_jar(temp)
             ids = incoming_ids(graph.with_suffix(""), node_id, jar, temp)
             domains = map_domain_ids(vertices, ids)
             links = [
-                {"source_url": f"https://{domains[i]}/", "target_url": f"https://{domain}/", "anchor_text": "", "rel": "", "referring_domain": domains[i], "graph_level": "domain", "graph_release": release}
-                for i in sorted(ids) if i in domains
+                {
+                    "source_url": f"https://{domains[i]}/",
+                    "target_url": f"https://{domain}/",
+                    "anchor_text": "",
+                    "rel": "",
+                    "referring_domain": domains[i],
+                    "graph_level": "domain",
+                    "graph_release": release,
+                }
+                for i in sorted(ids)
+                if i in domains
             ]
-            return {"provider": "Common Crawl", "status": "success", "target_domain": domain, "graph_release": release, "total_backlinks": len(links), "referring_domains": len(domains), "backlinks": links, "message": "Domain-level incoming links discovered from Common Crawl. Page-level URL, anchor and rel enrichment is separate."}
+
+            return {
+                "provider": "Common Crawl",
+                "status": "success",
+                "target_domain": domain,
+                "graph_release": release,
+                "total_backlinks": len(links),
+                "referring_domains": len(domains),
+                "backlinks": links,
+                "message": "Domain-level incoming links discovered from Common Crawl. Page-level URL, anchor and rel enrichment remains separate.",
+            }
     except requests.RequestException as exc:
-        return {"provider": "Common Crawl", "status": "request_failed", "target_domain": domain, "graph_release": release, "total_backlinks": 0, "referring_domains": 0, "backlinks": [], "message": str(exc)}
+        return {
+            "provider": "Common Crawl",
+            "status": "request_failed",
+            "target_domain": domain,
+            "graph_release": release,
+            "total_backlinks": 0,
+            "referring_domains": 0,
+            "backlinks": [],
+            "message": str(exc),
+        }
     except subprocess.CalledProcessError as exc:
-        return {"provider": "Common Crawl", "status": "processing_failed", "target_domain": domain, "graph_release": release, "total_backlinks": 0, "referring_domains": 0, "backlinks": [], "message": str(exc)}
+        return {
+            "provider": "Common Crawl",
+            "status": "processing_failed",
+            "target_domain": domain,
+            "graph_release": release,
+            "total_backlinks": 0,
+            "referring_domains": 0,
+            "backlinks": [],
+            "message": str(exc),
+        }
     except Exception as exc:
-        return {"provider": "Common Crawl", "status": "failed", "target_domain": domain, "graph_release": release, "total_backlinks": 0, "referring_domains": 0, "backlinks": [], "message": f"{type(exc).__name__}: {exc}"}
+        return {
+            "provider": "Common Crawl",
+            "status": "failed",
+            "target_domain": domain,
+            "graph_release": release,
+            "total_backlinks": 0,
+            "referring_domains": 0,
+            "backlinks": [],
+            "message": f"{type(exc).__name__}: {exc}",
+        }
