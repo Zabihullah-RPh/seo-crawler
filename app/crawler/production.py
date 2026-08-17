@@ -106,7 +106,6 @@ def site_metadata(url, headers):
                 }
     except Exception as e:
         data["ssl"] = {"enabled": False, "error": str(e)}
-    # Best-effort RDAP. Failure is intentionally non-fatal.
     try:
         req = urllib.request.Request(f"https://rdap.org/domain/{host}", headers={"User-Agent": "SEO-Crawler/1.0"})
         with urllib.request.urlopen(req, timeout=8) as r:
@@ -262,6 +261,8 @@ class ProductionCrawler:
     async def _export_and_report(self):
         import sqlite3
         from app.audit_engine import generate_report
+        from app.integrations.common_crawl_runtime import collect as collect_layer1
+        from app.integrations.backlink_layer2 import investigate_layer2
         os.makedirs("results", exist_ok=True)
         db = "data/crawler.db"
         out = Path(f"results/crawl_{self.crawl_id}.json")
@@ -273,7 +274,6 @@ class ProductionCrawler:
         schemas = [dict(r) for r in con.execute("SELECT * FROM schemas WHERE crawl_id=? ORDER BY id", (self.crawl_id,))]
         failed = [dict(r) for r in con.execute("SELECT * FROM issues WHERE crawl_id=? AND severity IN ('high','critical')", (self.crawl_id,))]
         con.close()
-        # Merge rich JSONL records over relational page records.
         jsonl = self.persistence.pages_file
         rich = []
         if jsonl.exists():
@@ -300,6 +300,18 @@ class ProductionCrawler:
                 "average_fully_loaded_seconds":round(sum(full_times)/len(full_times),3) if full_times else 0,
                 "domain":site_metadata(self.start_url, first_headers), "pages_crawled":len(pages), "pages_discovered":len(self.discovered)}
         data={"crawl_id":self.crawl_id,"start_url":self.start_url,"site":site,"pages":pages,"links":links,"images":images,"resources":resources,"schemas":schemas,"failed_urls":[x.get("url") for x in failed]}
+        backlinks = {"provider":"Common Crawl","layer1":{},"layer2":{}}
+        try:
+            layer1 = collect_layer1(self.start_url)
+            backlinks["layer1"] = layer1
+            if layer1.get("status") == "success" and layer1.get("backlinks"):
+                print(f"[BACKLINKS] Layer 1 found {layer1.get('referring_domains',0)} referring domains; starting Layer 2 investigation")
+                backlinks["layer2"] = await investigate_layer2(self.start_url, layer1)
+            else:
+                backlinks["layer2"] = {"status":"skipped","reason":layer1.get("status","unknown"),"links_found":0,"backlinks":[]}
+        except Exception as exc:
+            backlinks["layer2"] = {"status":"failed","links_found":0,"backlinks":[],"message":f"{type(exc).__name__}: {exc}"}
+        data["backlinks"] = backlinks
         out.write_text(json.dumps(data,indent=2,ensure_ascii=False,default=str),encoding="utf-8")
         print(f"[JSON] Saved: {out}")
         html_path = generate_report(data, out)
