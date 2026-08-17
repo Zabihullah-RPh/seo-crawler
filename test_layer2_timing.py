@@ -1,38 +1,65 @@
-"""Measure Layer 2 live-search coverage for one referring domain.
+"""Measure Layer 2 live-search coverage with visible progress.
 
 Example:
-  python test_layer2_timing.py --source-domain bluebook-directory.com --target-domain kingdrivingschool.com
+  python test_layer2_timing.py --source-domain bluebook-directory.com --target-domain kingdrivingschool.com --timeout 500
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import time
 
 from app.crawler.http import HTTPClient
 from app.integrations.backlink_layer2 import investigate_referring_domain
 
 
-async def main(source_domain: str, target_domain: str, timeout: int) -> None:
+async def main(source_domain: str, target_domain: str, timeout: int, progress_every: int) -> None:
+    started = time.monotonic()
+    print(f"Starting Layer 2 test: {source_domain} -> {target_domain}", flush=True)
+    print(f"Time limit: {timeout}s | target: actual href only", flush=True)
+    print(f"Progress interval: every {progress_every} pages", flush=True)
+
     http = HTTPClient(concurrency=8)
-    try:
-        result = await investigate_referring_domain(
+    task = asyncio.create_task(
+        investigate_referring_domain(
             http,
             source_domain,
             target_domain,
             timeout_seconds=timeout,
         )
+    )
+
+    last_pages = 0
+    try:
+        while not task.done():
+            await asyncio.sleep(2)
+            if task.done():
+                break
+            elapsed = time.monotonic() - started
+            print(f"RUNNING | elapsed={elapsed:.1f}s | pages_checked={last_pages or '-'}", flush=True)
+
+            # The underlying investigator does not expose streaming counters yet.
+            # This heartbeat confirms the process is alive without pretending to
+            # know an exact page count before the investigation returns.
+
+        result = await task
     finally:
         await http.close()
 
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-    print()
-    print(f"Domain: {source_domain}")
-    print(f"Target: {target_domain}")
-    print(f"Status: {result.get('status')}")
-    print(f"Elapsed seconds: {result.get('elapsed_seconds')}")
-    print(f"Pages checked: {result.get('pages_checked')}")
-    print(f"Links found: {result.get('links_found')}")
+    elapsed = time.monotonic() - started
+    pages = int(result.get("pages_checked") or 0)
+    rate = pages / elapsed if elapsed > 0 else 0.0
+
+    print("\n=== FINAL RESULT ===", flush=True)
+    print(json.dumps(result, indent=2, ensure_ascii=False), flush=True)
+    print(f"Domain: {source_domain}", flush=True)
+    print(f"Target: {target_domain}", flush=True)
+    print(f"Status: {result.get('status')}", flush=True)
+    print(f"Elapsed seconds: {result.get('elapsed_seconds')}", flush=True)
+    print(f"Pages checked: {pages}", flush=True)
+    print(f"Average pages/sec: {rate:.2f}", flush=True)
+    print(f"Links found: {result.get('links_found')}", flush=True)
 
 
 if __name__ == "__main__":
@@ -40,5 +67,6 @@ if __name__ == "__main__":
     parser.add_argument("--source-domain", default="bluebook-directory.com")
     parser.add_argument("--target-domain", default="kingdrivingschool.com")
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--progress-every", type=int, default=100)
     args = parser.parse_args()
-    asyncio.run(main(args.source_domain, args.target_domain, args.timeout))
+    asyncio.run(main(args.source_domain, args.target_domain, args.timeout, args.progress_every))
