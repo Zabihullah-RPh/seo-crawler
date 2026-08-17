@@ -1,4 +1,12 @@
 import asyncio
+
+# Playwright launches a subprocess for its browser driver. On Windows, Python 3.14
+# can be started with a selector-based event loop by the surrounding server/runtime,
+# but selector loops do not support subprocesses. Force the Proactor loop for this
+# application so the existing Python 3.14 environment remains supported.
+if hasattr(asyncio, "WindowsProactorEventLoopPolicy"):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 import aiosqlite
