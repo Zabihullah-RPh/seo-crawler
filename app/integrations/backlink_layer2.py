@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
+from typing import Callable
 from urllib.parse import urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -178,6 +179,7 @@ async def investigate_referring_domain(
     target_domain: str,
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    progress_callback: Callable[[int, float, int], None] | None = None,
 ) -> dict:
     started = time.monotonic()
     deadline = started + max(1.0, float(timeout_seconds))
@@ -208,17 +210,25 @@ async def investigate_referring_domain(
         result = await _fetch_first_working(http, alternatives, deadline)
         response = result.get("response")
         if not response:
+            if progress_callback:
+                progress_callback(attempted, time.monotonic() - started, len(queue))
             continue
         status = int(getattr(response, "status_code", 0) or 0)
         if status in (401, 403, 429):
             blocked += 1
+            if progress_callback:
+                progress_callback(attempted, time.monotonic() - started, len(queue))
             continue
         if status < 200 or status >= 400:
+            if progress_callback:
+                progress_callback(attempted, time.monotonic() - started, len(queue))
             continue
 
         headers = dict(getattr(response, "headers", {}) or {})
         content_type = str(headers.get("content-type", ""))
         if "text/html" not in content_type.lower():
+            if progress_callback:
+                progress_callback(attempted, time.monotonic() - started, len(queue))
             continue
 
         final_url = _canonicalize(str(getattr(response, "url", url)))
@@ -229,12 +239,15 @@ async def investigate_referring_domain(
                 item["layer"] = 2
                 item["found_via"] = "live_crawl"
             found.extend(current)
+            elapsed = time.monotonic() - started
+            if progress_callback:
+                progress_callback(attempted, elapsed, len(queue))
             return {
                 "status": "confirmed",
                 "referring_domain": source_domain,
                 "target_domain": target_domain,
                 "pages_checked": attempted,
-                "elapsed_seconds": round(time.monotonic() - started, 2),
+                "elapsed_seconds": round(elapsed, 2),
                 "links_found": len(found),
                 "backlinks": found,
             }
@@ -254,6 +267,9 @@ async def investigate_referring_domain(
             if nxt not in queue:
                 queue.append(nxt)
 
+        if progress_callback:
+            progress_callback(attempted, time.monotonic() - started, len(queue))
+
     elapsed = time.monotonic() - started
     if time.monotonic() >= deadline:
         status = "timeout"
@@ -261,6 +277,9 @@ async def investigate_referring_domain(
         status = "blocked"
     else:
         status = "not_found"
+
+    if progress_callback:
+        progress_callback(attempted, elapsed, len(queue))
 
     return {
         "status": status,
