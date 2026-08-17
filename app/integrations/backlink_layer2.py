@@ -20,26 +20,41 @@ from app.crawler.http import HTTPClient
 from app.utils.urls import normalize_url
 
 
-DEFAULT_TIMEOUT_SECONDS = 300  # 5 minutes per Layer 1 referring domain.
+DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_CONCURRENCY = 8
 
 
+def _host(url: str) -> str:
+    try:
+        host = (urlparse(url).hostname or "").strip().lower().rstrip(".")
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
 def _domain(url: str) -> str:
-    host = (urlparse(url).hostname or "").lower().rstrip(".")
-    return host[4:] if host.startswith("www.") else host
+    return _host(url)
 
 
 def _same_domain(a: str, b: str) -> bool:
-    return _domain(a) == _domain(b)
+    return bool(_host(a)) and _host(a) == _host(b)
+
+
+def _is_relative_href(raw: str) -> bool:
+    raw = (raw or "").strip().lower()
+    return not raw.startswith(("http://", "https://", "//"))
+
+
+def _same_domain_or_relative(raw_href: str, absolute_url: str, source_url: str) -> bool:
+    if _is_relative_href(raw_href):
+        return True
+    return _same_domain(absolute_url, source_url)
 
 
 def _target_match(href: str, target_domain: str) -> bool:
-    """Match only links whose actual destination host is the target domain.
-
-    We deliberately do not inspect anchor text, titles, page copy, or URL
-    keywords. The href destination alone determines whether this is a match.
-    """
-    return _domain(href) == target_domain
+    return _host(href) == _host(target_domain)
 
 
 def _canonicalize(url: str) -> str:
@@ -59,11 +74,9 @@ def _extract_target_links(html: str, source_url: str, target_domain: str) -> lis
         absolute = _canonicalize(urldefrag(urljoin(source_url, raw))[0])
         if not _target_match(absolute, target_domain):
             continue
-
         rel = tag.get("rel") or []
         if isinstance(rel, str):
             rel = rel.split()
-
         results.append({
             "source_url": source_url,
             "target_url": absolute,
@@ -77,7 +90,8 @@ def _extract_target_links(html: str, source_url: str, target_domain: str) -> lis
 
 
 def _origin_urls(source_domain: str) -> list[str]:
-    return [f"https://{source_domain}/", f"http://{source_domain}/"]
+    host = _host(source_domain) or str(source_domain).strip().lower()
+    return [f"https://{host}/", f"http://{host}/"]
 
 
 async def _fetch_first_working(http: HTTPClient, urls: list[str], deadline: float):
@@ -120,7 +134,6 @@ async def _discover_sitemap_urls(http: HTTPClient, source_domain: str, deadline:
                 if line.lower().startswith("sitemap:"):
                     sitemap_candidates.append(line.split(":", 1)[1].strip())
             continue
-
         soup = BeautifulSoup(text, "xml")
         for loc in soup.find_all("loc"):
             href = str(loc.get_text(" ", strip=True)).strip()
@@ -137,7 +150,6 @@ async def _discover_sitemap_urls(http: HTTPClient, source_domain: str, deadline:
         if sm in visited_maps:
             continue
         visited_maps.add(sm)
-
         result = await _fetch_first_working(http, [sm], deadline)
         response = result.get("response")
         if not response:
@@ -147,11 +159,9 @@ async def _discover_sitemap_urls(http: HTTPClient, source_domain: str, deadline:
         root_name = soup.find()
         is_index = bool(root_name and root_name.name and root_name.name.lower().endswith("index"))
         locs = [str(loc.get_text(" ", strip=True)).strip() for loc in soup.find_all("loc")]
-
         if is_index:
             pending.extend(x for x in locs if x)
             continue
-
         for href in locs:
             if time.monotonic() >= deadline:
                 break
@@ -159,7 +169,6 @@ async def _discover_sitemap_urls(http: HTTPClient, source_domain: str, deadline:
             if href and _same_domain(href, source_domain) and href not in seen_pages:
                 seen_pages.add(href)
                 urls.append(href)
-
     return urls
 
 
@@ -170,11 +179,6 @@ async def investigate_referring_domain(
     *,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
 ) -> dict:
-    """Search one referring domain until a target href is found or timeout.
-
-    There is no artificial page or depth cap. The only search limit is the
-    wall-clock timeout, plus the site's own reachability and crawl graph.
-    """
     started = time.monotonic()
     deadline = started + max(1.0, float(timeout_seconds))
     found: list[dict] = []
@@ -183,11 +187,8 @@ async def investigate_referring_domain(
     blocked = 0
     attempted = 0
 
-    # Sitemaps often expose deep profile/listing pages that homepage crawling
-    # would take a long time to discover, so use them as additional seeds.
     for url in await _discover_sitemap_urls(http, source_domain, deadline):
         queue.append(url)
-
     for seed in reversed(_origin_urls(source_domain)):
         queue.appendleft(seed)
 
@@ -208,7 +209,6 @@ async def investigate_referring_domain(
         response = result.get("response")
         if not response:
             continue
-
         status = int(getattr(response, "status_code", 0) or 0)
         if status in (401, 403, 429):
             blocked += 1
@@ -223,26 +223,22 @@ async def investigate_referring_domain(
 
         final_url = _canonicalize(str(getattr(response, "url", url)))
         html = getattr(response, "text", "") or ""
-
-        # This is the only backlink test: inspect href destinations.
         current = _extract_target_links(html, final_url, target_domain)
         if current:
             for item in current:
                 item["layer"] = 2
                 item["found_via"] = "live_crawl"
             found.extend(current)
-            elapsed = time.monotonic() - started
             return {
                 "status": "confirmed",
                 "referring_domain": source_domain,
                 "target_domain": target_domain,
                 "pages_checked": attempted,
-                "elapsed_seconds": round(elapsed, 2),
+                "elapsed_seconds": round(time.monotonic() - started, 2),
                 "links_found": len(found),
                 "backlinks": found,
             }
 
-        # No target href on this page. Continue discovering internal pages.
         soup = BeautifulSoup(html, "html.parser")
         discovered: list[str] = []
         for tag in soup.find_all("a", href=True):
@@ -252,9 +248,11 @@ async def investigate_referring_domain(
             if not raw or raw.startswith(("#", "javascript:", "mailto:", "tel:")):
                 continue
             absolute = _canonicalize(urldefrag(urljoin(final_url, raw))[0])
-            if _same_domain(absolute, source_domain) and absolute not in checked:
+            if _same_domain_or_relative(raw, absolute, source_domain) and absolute not in checked:
                 discovered.append(absolute)
-        queue.extend(discovered)
+        for nxt in discovered:
+            if nxt not in queue:
+                queue.append(nxt)
 
     elapsed = time.monotonic() - started
     if time.monotonic() >= deadline:
@@ -309,35 +307,13 @@ async def investigate_layer2(
         async with sem:
             try:
                 return await asyncio.wait_for(
-                    investigate_referring_domain(
-                        http,
-                        domain,
-                        target_domain,
-                        timeout_seconds=timeout_seconds,
-                    ),
+                    investigate_referring_domain(http, domain, target_domain, timeout_seconds=timeout_seconds),
                     timeout=max(1.0, float(timeout_seconds)) + 5,
                 )
             except asyncio.TimeoutError:
-                return {
-                    "status": "timeout",
-                    "referring_domain": domain,
-                    "target_domain": target_domain,
-                    "pages_checked": 0,
-                    "elapsed_seconds": float(timeout_seconds),
-                    "links_found": 0,
-                    "backlinks": [],
-                }
+                return {"status":"timeout","referring_domain":domain,"target_domain":target_domain,"pages_checked":0,"elapsed_seconds":float(timeout_seconds),"links_found":0,"backlinks":[]}
             except Exception as exc:
-                return {
-                    "status": "error",
-                    "referring_domain": domain,
-                    "target_domain": target_domain,
-                    "pages_checked": 0,
-                    "elapsed_seconds": 0,
-                    "links_found": 0,
-                    "backlinks": [],
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
+                return {"status":"error","referring_domain":domain,"target_domain":target_domain,"pages_checked":0,"elapsed_seconds":0,"links_found":0,"backlinks":[],"error":f"{type(exc).__name__}: {exc}"}
 
     try:
         groups = await asyncio.gather(*(one(domain) for domain in layer1_domains))
@@ -347,20 +323,12 @@ async def investigate_layer2(
     links: list[dict] = []
     domain_status: list[dict] = []
     statuses: set[str] = set()
-
     for domain, group in zip(layer1_domains, groups):
         valid = [item for item in group.get("backlinks", []) if item.get("target_url")]
         links.extend([{**item, "referring_domain": domain} for item in valid])
         status = str(group.get("status") or "error")
         statuses.add(status)
-        domain_status.append({
-            "referring_domain": domain,
-            "status": status,
-            "pages_checked": group.get("pages_checked", 0),
-            "elapsed_seconds": group.get("elapsed_seconds", 0),
-            "links_found": len(valid),
-            "error": group.get("error"),
-        })
+        domain_status.append({"referring_domain":domain,"status":status,"pages_checked":group.get("pages_checked",0),"elapsed_seconds":group.get("elapsed_seconds",0),"links_found":len(valid),"error":group.get("error")})
 
     if links:
         overall_status = "confirmed"
@@ -379,12 +347,7 @@ async def investigate_layer2(
         "layer1_referring_domains": len(layer1_domains),
         "domains_investigated": len(layer1_domains),
         "links_found": len(links),
-        "limits": {
-            "timeout_seconds_per_domain": timeout_seconds,
-            "concurrency": concurrency,
-            "page_limit": None,
-            "depth_limit": None,
-        },
+        "limits": {"timeout_seconds_per_domain": timeout_seconds,"concurrency": concurrency,"page_limit": None,"depth_limit": None},
         "domains": domain_status,
         "backlinks": links,
     }
