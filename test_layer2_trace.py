@@ -10,11 +10,17 @@ from app.utils.urls import normalize_url
 
 
 def domain(url: str) -> str:
-    return (urlparse(url).hostname or "").lower().removeprefix("www.")
+    host = (urlparse(url).hostname or "").lower().strip().rstrip(".")
+    if host.startswith("www."):
+        host = host[4:]
+    return host
 
 
-def same_domain(a: str, b: str) -> bool:
-    return domain(a) == domain(b)
+def same_domain_or_relative(raw_href: str, absolute_url: str, source_url: str) -> bool:
+    raw = (raw_href or "").strip().lower()
+    if not raw.startswith(("http://", "https://", "//")):
+        return True
+    return domain(absolute_url) == domain(source_url)
 
 
 async def main() -> None:
@@ -25,7 +31,7 @@ async def main() -> None:
     args = parser.parse_args()
 
     source = args.source_domain.lower().strip()
-    target = args.target_domain.lower().strip()
+    target = args.target_domain.lower().strip().removeprefix("www.").rstrip(".")
     deadline = asyncio.get_running_loop().time() + args.seconds
 
     http = HTTPClient(concurrency=4)
@@ -63,7 +69,7 @@ async def main() -> None:
                 absolute = normalize_url(urldefrag(urljoin(final_url, href))[0])
                 if domain(absolute) == target:
                     target_hits.append(absolute)
-                if same_domain(absolute, source) and absolute not in seen:
+                if same_domain_or_relative(href, absolute, final_url) and absolute not in seen:
                     same.append(absolute)
 
             print(f"FETCH | {url} | final={final_url} | status={status} | type={ctype} | links={len(anchors)} | internal_new={len(same)} | target_hits={len(target_hits)}")
