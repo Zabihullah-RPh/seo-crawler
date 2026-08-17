@@ -18,46 +18,28 @@ def _issue(bucket, severity, message, detail=""):
 
 
 def _build_link_graph(data):
-    """Build a trustworthy internal-link graph from page-level link records.
-
-    The crawler stores the links extracted from each page under page["links"].
-    The relational links table is also available, but older exports can contain
-    stale/incorrect internal flags. We therefore determine internal status from
-    normalized hostnames rather than URL-prefix matching or truthiness of a
-    database integer/string.
-    """
     start_url = normalize_url(data.get("start_url", ""))
     incoming = Counter()
     outgoing = Counter()
     seen = set()
-
-    page_urls = {
-        normalize_url(p.get("url", ""))
-        for p in data.get("pages", [])
-        if p.get("url")
-    }
+    page_urls = {normalize_url(p.get("url", "")) for p in data.get("pages", []) if p.get("url")}
 
     def add_link(source, target):
         source = normalize_url(source)
         if not source or not target:
             return
-
-        # Resolve relative links against their source page before classification.
         absolute = urljoin(source, str(target).strip())
         target = normalize_url(absolute)
         if not target:
             return
-
         key = (source, target)
         if key in seen:
             return
         seen.add(key)
-
         if same_host(target, start_url):
             incoming[target] += 1
             outgoing[source] += 1
 
-    # Prefer the authoritative page-level extracted links.
     for page in data.get("pages", []):
         source = page.get("url", "")
         for link in page.get("links", []) or []:
@@ -65,15 +47,10 @@ def _build_link_graph(data):
                 add_link(source, link.get("url") or link.get("target_url"))
             elif isinstance(link, str):
                 add_link(source, link)
-
-    # If page-level links are unavailable (for example, an older crawl export),
-    # fall back to the relational links table, but NEVER trust its internal flag.
     if not seen:
         for link in data.get("links", []) or []:
-            if not isinstance(link, dict):
-                continue
-            add_link(link.get("source_url", ""), link.get("target_url", ""))
-
+            if isinstance(link, dict):
+                add_link(link.get("source_url", ""), link.get("target_url", ""))
     return incoming, outgoing, page_urls
 
 
@@ -81,7 +58,6 @@ def analyze(data):
     pages = data.get("pages", [])
     site = data.get("site", {}) or {}
     incoming, outgoing, _ = _build_link_graph(data)
-
     findings = defaultdict(list)
     counts = Counter()
     total_checks = 0
@@ -108,7 +84,6 @@ def analyze(data):
         robots = (p.get("robots") or "").lower()
         schema = p.get("schemas") or []
         links_out = outgoing[normalize_url(url)]
-
         check(url, 200 <= status < 400, "critical" if status >= 500 else "high", f"HTTP {status}")
         check(url, bool(title), "critical", "Missing title")
         if title:
@@ -183,9 +158,6 @@ def analyze(data):
     except (TypeError, ValueError):
         pages_discovered = pages_crawled
     pages_discovered = max(pages_discovered, pages_crawled)
-
-    # Crawl coverage is intentionally displayed as a simple 10-point grade.
-    # 98-100% = 10/10 green, 95-97.99% = 9/10 orange, <95% = 7/10 red.
     coverage = (pages_crawled / pages_discovered * 100) if pages_discovered else 0
     if coverage >= 98:
         crawl_coverage_score = 10
@@ -252,9 +224,31 @@ def html_report(audit_data, crawl_data):
     ssl = domain.get("ssl", {}) or {}
     platform = site.get("platform") or "Custom / Unknown"
     site_lines = f"<p><b>Platform:</b> {escape(platform)}</p><p><b>Tracking / Pixels / Tags:</b> {escape(tracking)}</p><p><b>Average DOM Load:</b> {site.get('average_dom_loaded_seconds', 0)} seconds</p><p><b>Average Fully Loaded:</b> {site.get('average_fully_loaded_seconds', 0)} seconds</p><p><b>Domain:</b> {escape(domain.get('hostname', ''))}</p><p><b>Domain Created:</b> {escape(str((domain.get('domain_age') or {}).get('created', 'Not detected')))}</p><p><b>IP:</b> {escape(', '.join(domain.get('ip_addresses', [])) or 'Not detected')}</p><p><b>Server:</b> {escape(str(domain.get('server') or 'Not disclosed'))}</p><p><b>SSL:</b> {escape('Enabled' if ssl.get('enabled') else 'Not verified')}</p>"
+
+    backlinks = crawl_data.get("backlinks", {}) or {}
+    layer1 = backlinks.get("layer1", {}) or {}
+    layer2 = backlinks.get("layer2", {}) or {}
+    l1_rows = []
+    for item in layer1.get("backlinks", []) or []:
+        src = escape(item.get("source_url", ""), quote=True)
+        tgt = escape(item.get("target_url", ""), quote=True)
+        l1_rows.append(f'<tr><td><a href="{src}" target="_blank" rel="noopener noreferrer">{escape(item.get("referring_domain", ""))}</a></td><td>{tgt}</td></tr>')
+    if not l1_rows:
+        l1_rows.append('<tr><td colspan="2">No Layer 1 referring domains available.</td></tr>')
+    l2_rows = []
+    for item in layer2.get("backlinks", []) or []:
+        src = escape(item.get("source_url", ""), quote=True)
+        tgt = escape(item.get("target_url", ""), quote=True)
+        anchor = escape(item.get("anchor_text", ""))
+        rel = escape(item.get("rel", ""))
+        l2_rows.append(f'<tr><td><a href="{src}" target="_blank" rel="noopener noreferrer">{escape(item.get("source_url", ""))}</a></td><td>{tgt}</td><td>{anchor}</td><td>{rel}</td></tr>')
+    if not l2_rows:
+        l2_rows.append('<tr><td colspan="4">No confirmed page-level backlinks found.</td></tr>')
+    backlink_section = f'''<div class="site"><h2>Backlinks</h2><p><b>Provider:</b> Common Crawl</p><p><b>Layer 1 Status:</b> {escape(str(layer1.get("status", "unknown")))}</p><p><b>Total Backlinks:</b> {int(layer1.get("total_backlinks", 0) or 0)}</p><p><b>Referring Domains:</b> {int(layer1.get("referring_domains", 0) or 0)}</p><h3>Referring Domains</h3><table><tr><th>Source Domain</th><th>Target</th></tr>{''.join(l1_rows)}</table><h3>Layer 2 — Confirmed Page-Level Links</h3><p><b>Status:</b> {escape(str(layer2.get("status", "unknown")))} &nbsp; <b>Confirmed Links:</b> {int(layer2.get("links_found", 0) or 0)}</p><table><tr><th>Source URL</th><th>Target URL</th><th>Anchor Text</th><th>Rel</th></tr>{''.join(l2_rows)}</table></div>'''
+
     return f'''<!doctype html><html><head><meta charset="utf-8"><title>SEO Audit Report - Crawl {crawl_data.get('crawl_id')}</title><style>
 body{{font-family:Arial,sans-serif;background:#f4f5f7;color:#222;margin:0;padding:35px}}.container{{max-width:1400px;margin:auto;background:#fff;padding:35px}}.metrics{{display:flex;gap:20px;margin:25px 0}}.metric{{flex:1;border:1px solid #ddd;padding:20px;border-radius:8px}}.metric strong{{display:block;font-size:30px;margin-top:8px}}.score-red{{color:#dc2626!important}}.score-orange{{color:#d97706!important}}.score-green{{color:#16a34a!important}}.pages-blue{{color:#2563eb!important}}.site{{border:1px solid #ddd;padding:20px;margin-bottom:30px}}table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{border:1px solid #ddd;padding:12px;text-align:left;vertical-align:top}}th{{background:#eee}}a{{color:#2563eb;text-decoration:underline}}a:hover{{text-decoration:none}}.legend{{font-size:13px;color:#666;margin-top:8px}}
-</style></head><body><div class="container"><h1>SEO Audit Report</h1><p>Crawl ID: {crawl_data.get('crawl_id')}</p><div class="metrics"><div class="metric">SEO Score<strong class="{_score_class(s['seo_score'])}">{s['seo_score']}/100</strong></div><div class="metric">Site Health<strong class="{_score_class(s['site_health'])}">{s['site_health']}/100</strong></div><div class="metric">Pages Crawled<strong class="{_crawl_coverage_class(s['crawl_coverage_score'])}">{s['crawl_coverage_score']}/10</strong></div></div><div class="site"><h2>Site-Wide Information</h2>{site_lines}</div><h2>Issues by Page</h2><table><tr><th>Page</th><th>Problems / Opportunities</th></tr>{''.join(rows)}</table></div></body></html>'''
+</style></head><body><div class="container"><h1>SEO Audit Report</h1><p>Crawl ID: {crawl_data.get('crawl_id')}</p><div class="metrics"><div class="metric">SEO Score<strong class="{_score_class(s['seo_score'])}">{s['seo_score']}/100</strong></div><div class="metric">Site Health<strong class="{_score_class(s['site_health'])}">{s['site_health']}/100</strong></div><div class="metric">Pages Crawled<strong class="{_crawl_coverage_class(s['crawl_coverage_score'])}">{s['crawl_coverage_score']}/10</strong></div></div><div class="site"><h2>Site-Wide Information</h2>{site_lines}</div>{backlink_section}<h2>Issues by Page</h2><table><tr><th>Page</th><th>Problems / Opportunities</th></tr>{''.join(rows)}</table></div></body></html>'''
 
 
 def generate_report(data, source_path):
