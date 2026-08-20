@@ -1,29 +1,16 @@
-"""Public-web backlink discovery and Layer 2 verification.
-
-This module is deliberately separate from the Common Crawl domain graph.
-It uses public search-engine result pages to discover candidate external pages,
-then fetches those pages and inspects their actual HTML anchors for links to the
-target domain. Search results are discovery signals, not backlink evidence;
-only an HTML anchor found on an external source page becomes a confirmed link.
-
-No paid API is required. Engines are best-effort and may rate-limit automated
-requests, so failures are returned as diagnostics rather than treated as zero
-backlinks.
-"""
+"""Public-web backlink discovery and Layer 2 verification."""
 from __future__ import annotations
 
 import html
 import re
 from collections import Counter
-from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
-
 
 DEFAULT_ENGINES = ("bing", "duckduckgo")
 DEFAULT_MAX_RESULTS_PER_ENGINE = 50
 DEFAULT_TIMEOUT = 20
-
 A_RE = re.compile(r"<a\b([^>]*)>(.*?)</a>", re.I | re.S)
 HREF_RE = re.compile(r"\bhref\s*=\s*([\"'])(.*?)\1", re.I | re.S)
 REL_RE = re.compile(r"\brel\s*=\s*([\"'])(.*?)\1", re.I | re.S)
@@ -42,9 +29,7 @@ def is_target(value: str, target_domain: str) -> bool:
 
 
 def clean_anchor(value: str) -> str:
-    value = TAG_RE.sub(" ", value)
-    value = html.unescape(value)
-    return re.sub(r"\s+", " ", value).strip()
+    return re.sub(r"\s+", " ", html.unescape(TAG_RE.sub(" ", value))).strip()
 
 
 def classify_rel(rel: str) -> str:
@@ -59,25 +44,22 @@ def classify_rel(rel: str) -> str:
 
 
 def _bing_search(client: requests.Session, query: str, limit: int) -> list[str]:
-    response = client.get(
-        "https://www.bing.com/search",
-        params={"q": query, "count": min(limit, 50)},
-        timeout=DEFAULT_TIMEOUT,
-    )
-    response.raise_for_status()
     urls: list[str] = []
-    for href in re.findall(r'<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>.*?<a[^>]+href="([^"]+)"', response.text, re.I | re.S):
-        if href.startswith("http://") or href.startswith("https://"):
-            urls.append(html.unescape(href))
+    for first in range(1, min(limit, 100) + 1, 10):
+        response = client.get("https://www.bing.com/search", params={"q": query, "count": 10, "first": first}, timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        found = [html.unescape(h) for h in re.findall(r'<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>.*?<a[^>]+href="([^"]+)"', response.text, re.I | re.S)]
+        found = [h for h in found if h.startswith(("http://", "https://"))]
+        if not found:
+            break
+        urls.extend(found)
+        if len(found) < 10:
+            break
     return urls[:limit]
 
 
 def _duckduckgo_search(client: requests.Session, query: str, limit: int) -> list[str]:
-    response = client.get(
-        "https://html.duckduckgo.com/html/",
-        params={"q": query},
-        timeout=DEFAULT_TIMEOUT,
-    )
+    response = client.get("https://html.duckduckgo.com/html/", params={"q": query, "num": min(limit, 50)}, timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
     urls: list[str] = []
     for raw in re.findall(r'<a[^>]+class="result__a"[^>]+href="([^"]+)"', response.text, re.I):
@@ -86,69 +68,62 @@ def _duckduckgo_search(client: requests.Session, query: str, limit: int) -> list
         if parsed.netloc.endswith("duckduckgo.com") and "uddg" in parse_qs(parsed.query):
             value = parse_qs(parsed.query)["uddg"][0]
         value = unquote(value)
-        if value.startswith("http://") or value.startswith("https://"):
+        if value.startswith(("http://", "https://")):
             urls.append(value)
     return urls[:limit]
 
 
-def discover_candidates(
-    target_domain: str,
-    *,
-    engines: tuple[str, ...] = DEFAULT_ENGINES,
-    max_results_per_engine: int = DEFAULT_MAX_RESULTS_PER_ENGINE,
-) -> tuple[list[str], dict[str, str]]:
-    """Discover external candidate pages that may link to target_domain."""
+def _queries(target: str) -> list[str]:
+    return [
+        f'"{target}" -site:{target}',
+        f'"https://{target}" -site:{target}',
+        f'"www.{target}" -site:{target}',
+        f'"{target}/" -site:{target}',
+        f'"Australian Veterinary Wholesalers" "{target}" -site:{target}',
+    ]
+
+
+def discover_candidates(target_domain: str, *, engines: tuple[str, ...] = DEFAULT_ENGINES, max_results_per_engine: int = DEFAULT_MAX_RESULTS_PER_ENGINE) -> tuple[list[str], dict[str, str]]:
     target = normalize_domain(target_domain)
-    query = f'"{target}" -site:{target}'
     candidates: list[str] = []
     errors: dict[str, str] = {}
-
+    queries = _queries(target)
     with requests.Session() as client:
-        client.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0 (compatible; SEO-Crawler/4.0; backlink-discovery)",
-                "Accept-Language": "en-US,en;q=0.9",
-            }
-        )
+        client.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36", "Accept-Language": "en-US,en;q=0.9"})
         for engine in engines:
-            try:
-                if engine == "bing":
-                    found = _bing_search(client, query, max_results_per_engine)
-                elif engine == "duckduckgo":
-                    found = _duckduckgo_search(client, query, max_results_per_engine)
-                else:
-                    errors[engine] = "unsupported_engine"
-                    continue
-                candidates.extend(found)
-            except Exception as exc:
-                errors[engine] = f"{type(exc).__name__}: {exc}"
-
+            engine_errors: list[str] = []
+            for query in queries:
+                try:
+                    per_query = max(1, max_results_per_engine // len(queries))
+                    found = _bing_search(client, query, per_query) if engine == "bing" else _duckduckgo_search(client, query, per_query) if engine == "duckduckgo" else []
+                    if engine not in ("bing", "duckduckgo"):
+                        engine_errors.append("unsupported_engine")
+                        break
+                    candidates.extend(found)
+                except Exception as exc:
+                    engine_errors.append(f"{type(exc).__name__}: {exc}")
+            if engine_errors:
+                errors[engine] = " | ".join(engine_errors)
     unique: list[str] = []
     seen: set[str] = set()
     for url in candidates:
-        if not url or url in seen or is_target(url, target):
-            continue
-        seen.add(url)
-        unique.append(url)
+        if url and url not in seen and not is_target(url, target):
+            seen.add(url)
+            unique.append(url)
     return unique, errors
 
 
 def verify_page(client: requests.Session, source_url: str, target_domain: str) -> list[dict]:
-    """Fetch one external page and return only actual HTML links to target."""
     if is_target(source_url, target_domain):
         return []
-
     response = client.get(source_url, timeout=DEFAULT_TIMEOUT, allow_redirects=True)
     response.raise_for_status()
     final_source = response.url
-
     if is_target(final_source, target_domain):
         return []
-
     content_type = response.headers.get("content-type", "").lower()
     if content_type and "html" not in content_type and "xhtml" not in content_type:
         return []
-
     results: list[dict] = []
     for attrs, body in A_RE.findall(response.text):
         href_match = HREF_RE.search(attrs)
@@ -159,74 +134,29 @@ def verify_page(client: requests.Session, source_url: str, target_domain: str) -
             continue
         rel_match = REL_RE.search(attrs)
         rel = rel_match.group(2).strip() if rel_match else ""
-        results.append(
-            {
-                "source_url": final_source,
-                "source_domain": normalize_domain(final_source),
-                "target_url": target_url,
-                "anchor_text": clean_anchor(body),
-                "rel": rel,
-                "backlink_type": classify_rel(rel),
-            }
-        )
+        results.append({"source_url": final_source, "source_domain": normalize_domain(final_source), "target_url": target_url, "anchor_text": clean_anchor(body), "rel": rel, "backlink_type": classify_rel(rel)})
     return results
 
 
-def collect_public_backlinks(
-    target_domain: str,
-    *,
-    engines: tuple[str, ...] = DEFAULT_ENGINES,
-    max_results_per_engine: int = DEFAULT_MAX_RESULTS_PER_ENGINE,
-) -> dict:
-    """Discover and verify external backlinks using public search engines."""
+def collect_public_backlinks(target_domain: str, *, engines: tuple[str, ...] = DEFAULT_ENGINES, max_results_per_engine: int = DEFAULT_MAX_RESULTS_PER_ENGINE) -> dict:
     target = normalize_domain(target_domain)
     if not target:
         return {"provider": "Public Web", "status": "invalid_target", "backlinks": []}
-
-    candidates, discovery_errors = discover_candidates(
-        target,
-        engines=engines,
-        max_results_per_engine=max_results_per_engine,
-    )
-
+    candidates, discovery_errors = discover_candidates(target, engines=engines, max_results_per_engine=max_results_per_engine)
     backlinks: list[dict] = []
     seen: set[tuple[str, str, str, str]] = set()
     verification_errors: dict[str, str] = {}
-
     with requests.Session() as client:
-        client.headers.update(
-            {"User-Agent": "Mozilla/5.0 (compatible; SEO-Crawler/4.0; backlink-verification)"}
-        )
+        client.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36"})
         for source_url in candidates:
             try:
                 for item in verify_page(client, source_url, target):
-                    key = (
-                        item["source_url"],
-                        item["target_url"],
-                        item["anchor_text"],
-                        item["rel"],
-                    )
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    backlinks.append(item)
+                    key = (item["source_url"], item["target_url"], item["anchor_text"], item["rel"])
+                    if key not in seen:
+                        seen.add(key)
+                        backlinks.append(item)
             except Exception as exc:
                 verification_errors[source_url] = f"{type(exc).__name__}: {exc}"
-
     type_counts = Counter(item["backlink_type"] for item in backlinks)
     domains = {item["source_domain"] for item in backlinks}
-
-    return {
-        "provider": "Public Web",
-        "target_domain": target,
-        "status": "success",
-        "discovery_query": f'"{target}" -site:{target}',
-        "candidate_pages": len(candidates),
-        "total_backlinks": len(backlinks),
-        "referring_domains": len(domains),
-        "backlink_types": dict(type_counts),
-        "backlinks": backlinks,
-        "discovery_errors": discovery_errors,
-        "verification_errors": verification_errors,
-        "message": "Search engines discover candidate pages; backlinks are counted only after the external page HTML contains an actual link to the target domain.",
-    }
+    return {"provider": "Public Web", "target_domain": target, "status": "success", "discovery_query": _queries(target), "candidate_pages": len(candidates), "total_backlinks": len(backlinks), "referring_domains": len(domains), "backlink_types": dict(type_counts), "backlinks": backlinks, "discovery_errors": discovery_errors, "verification_errors": verification_errors, "message": "Multiple public-web queries discover candidate pages; backlinks are counted only after external HTML contains an actual anchor to the target domain."}
