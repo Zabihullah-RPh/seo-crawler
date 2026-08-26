@@ -5,7 +5,6 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -22,6 +21,8 @@ def section(n, name):
 async def main(url: str, max_pages: int = 5):
     from app.crawler.production import ProductionCrawler, site_metadata
     from app.integrations.common_crawl_runtime import collect as collect_common_crawl
+    from app.integrations.google_auth import get_credentials
+    from app.integrations.google_enrichment import _ga4_result, _run_pagespeed
     from app.integrations.google_enrichment import enrich as enrich_google
     from app.storage.db import create_crawl, initialize
 
@@ -38,10 +39,7 @@ async def main(url: str, max_pages: int = 5):
     timings["crawler_total"] = ts() - t
     details["crawl_id"] = crawl_id
     crawl_file = ROOT / "results" / f"crawl_{crawl_id}.json"
-    if crawl_file.exists():
-        data = json.loads(crawl_file.read_text(encoding="utf-8"))
-    else:
-        data = {}
+    data = json.loads(crawl_file.read_text(encoding="utf-8")) if crawl_file.exists() else {}
     details["pages"] = len(data.get("pages", []))
     details["links"] = len(data.get("links", []))
     details["images"] = len(data.get("images", []))
@@ -74,11 +72,11 @@ async def main(url: str, max_pages: int = 5):
     section(4, "PAGESPEED INSIGHTS (PUBLIC)")
     t = ts()
     try:
-        google = enrich_google(url)
-        result = google.get("pagespeed", {})
+        credentials = get_credentials()
+        token = getattr(credentials, "token", None)
+        result = _run_pagespeed(url, token)
         details["pagespeed"] = result
         status = result.get("status", "DATA_NOT_AVAILABLE")
-        details["google_for_timing"] = google
     except Exception as exc:
         status = "ERROR"
         details["pagespeed_error"] = f"{type(exc).__name__}: {exc}"
@@ -88,7 +86,7 @@ async def main(url: str, max_pages: int = 5):
     section(5, "GOOGLE PRIVATE ENRICHMENT")
     t = ts()
     try:
-        google = details.get("google_for_timing") or enrich_google(url)
+        google = enrich_google(url)
         details["google"] = google
         for key, value in google.items():
             if isinstance(value, dict):
