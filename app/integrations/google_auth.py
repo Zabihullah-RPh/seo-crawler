@@ -40,7 +40,7 @@ def get_credentials(
     client_secret_path: str | Path | None = None,
     token_path: str | Path | None = None,
 ) -> Credentials:
-    """Return OAuth credentials, reauthorizing when the cached token lacks scopes."""
+    """Return valid user OAuth credentials, refreshing only when all scopes are present."""
     requested_scopes = tuple(dict.fromkeys(scopes))
     client_secret = Path(client_secret_path) if client_secret_path else _credential_path(
         "GOOGLE_CLIENT_SECRET_FILE", "google_client_secret.json"
@@ -57,12 +57,11 @@ def get_credentials(
             creds = Credentials.from_authorized_user_file(
                 str(token_file), list(requested_scopes)
             )
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
             creds = None
 
-    # A cached token may be valid/refreshable but still lack a newly requested
-    # scope. Do NOT refresh that token first: Google can reject the refresh with
-    # invalid_scope. Force a fresh desktop OAuth flow instead.
+    # IMPORTANT: check the scopes before attempting refresh. A stale token
+    # that lacks a newly requested scope must be re-authorized, not refreshed.
     if creds and hasattr(creds, "has_scopes") and not creds.has_scopes(requested_scopes):
         creds = None
 
