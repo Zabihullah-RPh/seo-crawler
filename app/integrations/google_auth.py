@@ -8,9 +8,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-# Repository root is C:\\seo-crawler\\seo-crawler in the user's current setup.
-# Credentials are intentionally kept one level above the repository so they are
-# not accidentally committed to Git.
+# Keep credentials outside the repository by default.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKSPACE_ROOT = REPO_ROOT.parent
 REPO_CREDENTIALS = REPO_ROOT / "credentials"
@@ -21,12 +19,13 @@ DEFAULT_TOKEN = WORKSPACE_CREDENTIALS / "google_token.json"
 
 SEARCH_CONSOLE_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
 ANALYTICS_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
+OPENID_SCOPE = "openid"
 
-SCOPES = (SEARCH_CONSOLE_SCOPE, ANALYTICS_SCOPE)
+SCOPES = (SEARCH_CONSOLE_SCOPE, ANALYTICS_SCOPE, OPENID_SCOPE)
 
 
 def _credential_path(env_name: str, filename: str) -> Path:
-    """Resolve credentials from an explicit env var, then workspace, then repo."""
+    """Resolve credentials from an explicit env var, workspace, then repo."""
     override = os.getenv(env_name)
     if override:
         return Path(override)
@@ -43,7 +42,7 @@ def get_credentials(
     client_secret_path: str | Path | None = None,
     token_path: str | Path | None = None,
 ) -> Credentials:
-    """Return valid user OAuth credentials, refreshing or re-authorizing when needed."""
+    """Return valid Google user OAuth credentials, refreshing or re-authorizing when needed."""
     requested_scopes = tuple(dict.fromkeys(scopes))
     client_secret = Path(client_secret_path) if client_secret_path else _credential_path(
         "GOOGLE_CLIENT_SECRET_FILE", "google_client_secret.json"
@@ -66,8 +65,6 @@ def get_credentials(
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
 
-    # Google credentials can be valid while lacking a newly requested scope.
-    # Re-run desktop OAuth in that case instead of failing later with a vague 403.
     if creds and creds.valid and hasattr(creds, "has_scopes"):
         if not creds.has_scopes(requested_scopes):
             creds = None
