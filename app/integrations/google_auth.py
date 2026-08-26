@@ -8,14 +8,34 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-DEFAULT_CLIENT_SECRET = BASE_DIR / "credentials" / "google_client_secret.json"
-DEFAULT_TOKEN = BASE_DIR / "credentials" / "google_token.json"
+# Repository root is C:\\seo-crawler\\seo-crawler in the user's current setup.
+# Credentials are intentionally kept one level above the repository so they are
+# not accidentally committed to Git.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WORKSPACE_ROOT = REPO_ROOT.parent
+REPO_CREDENTIALS = REPO_ROOT / "credentials"
+WORKSPACE_CREDENTIALS = WORKSPACE_ROOT / "credentials"
+
+DEFAULT_CLIENT_SECRET = WORKSPACE_CREDENTIALS / "google_client_secret.json"
+DEFAULT_TOKEN = WORKSPACE_CREDENTIALS / "google_token.json"
 
 SEARCH_CONSOLE_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
 ANALYTICS_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
 
 SCOPES = (SEARCH_CONSOLE_SCOPE, ANALYTICS_SCOPE)
+
+
+def _credential_path(env_name: str, filename: str) -> Path:
+    """Resolve credentials from an explicit env var, then workspace, then repo."""
+    override = os.getenv(env_name)
+    if override:
+        return Path(override)
+
+    workspace_path = WORKSPACE_CREDENTIALS / filename
+    if workspace_path.exists():
+        return workspace_path
+
+    return REPO_CREDENTIALS / filename
 
 
 def get_credentials(
@@ -25,13 +45,11 @@ def get_credentials(
 ) -> Credentials:
     """Return valid user OAuth credentials, refreshing or re-authorizing when needed."""
     requested_scopes = tuple(dict.fromkeys(scopes))
-    client_secret = Path(
-        client_secret_path
-        or os.getenv("GOOGLE_CLIENT_SECRET_FILE", DEFAULT_CLIENT_SECRET)
+    client_secret = Path(client_secret_path) if client_secret_path else _credential_path(
+        "GOOGLE_CLIENT_SECRET_FILE", "google_client_secret.json"
     )
-    token_file = Path(
-        token_path
-        or os.getenv("GOOGLE_TOKEN_FILE", DEFAULT_TOKEN)
+    token_file = Path(token_path) if token_path else _credential_path(
+        "GOOGLE_TOKEN_FILE", "google_token.json"
     )
 
     token_file.parent.mkdir(parents=True, exist_ok=True)
