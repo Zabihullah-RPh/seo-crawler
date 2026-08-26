@@ -18,6 +18,7 @@ class PageSpeedClient:
         url: str,
         strategy: str = "mobile",
         categories: list[str] | None = None,
+        oauth_token: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"url": url, "strategy": strategy}
         if self.api_key:
@@ -25,6 +26,12 @@ class PageSpeedClient:
         for category in categories or ["performance", "accessibility", "best-practices", "seo"]:
             params.setdefault("category", []).append(category)
 
-        response = requests.get(self.ENDPOINT, params=params, timeout=self.timeout)
+        headers = {"Authorization": f"Bearer {oauth_token}"} if oauth_token else None
+        response = requests.get(
+            self.ENDPOINT,
+            params=params,
+            headers=headers,
+            timeout=self.timeout,
+        )
         response.raise_for_status()
         return response.json()
