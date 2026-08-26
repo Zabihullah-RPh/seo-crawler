@@ -12,10 +12,10 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_CLIENT_SECRET = BASE_DIR / "credentials" / "google_client_secret.json"
 DEFAULT_TOKEN = BASE_DIR / "credentials" / "google_token.json"
 
-SCOPES = (
-    "https://www.googleapis.com/auth/webmasters.readonly",
-    "https://www.googleapis.com/auth/analytics.readonly",
-)
+SEARCH_CONSOLE_SCOPE = "https://www.googleapis.com/auth/webmasters.readonly"
+ANALYTICS_SCOPE = "https://www.googleapis.com/auth/analytics.readonly"
+
+SCOPES = (SEARCH_CONSOLE_SCOPE, ANALYTICS_SCOPE)
 
 
 def get_credentials(
@@ -23,7 +23,8 @@ def get_credentials(
     client_secret_path: str | Path | None = None,
     token_path: str | Path | None = None,
 ) -> Credentials:
-    """Return cached Google OAuth credentials, starting desktop OAuth when needed."""
+    """Return valid user OAuth credentials, refreshing or re-authorizing when needed."""
+    requested_scopes = tuple(dict.fromkeys(scopes))
     client_secret = Path(
         client_secret_path
         or os.getenv("GOOGLE_CLIENT_SECRET_FILE", DEFAULT_CLIENT_SECRET)
@@ -34,13 +35,24 @@ def get_credentials(
     )
 
     token_file.parent.mkdir(parents=True, exist_ok=True)
-    creds = None
+    creds: Credentials | None = None
 
     if token_file.exists():
-        creds = Credentials.from_authorized_user_file(str(token_file), list(scopes))
+        try:
+            creds = Credentials.from_authorized_user_file(
+                str(token_file), list(requested_scopes)
+            )
+        except (ValueError, KeyError, TypeError):
+            creds = None
 
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
+
+    # Google credentials can be valid while lacking a newly requested scope.
+    # Re-run desktop OAuth in that case instead of failing later with a vague 403.
+    if creds and creds.valid and hasattr(creds, "has_scopes"):
+        if not creds.has_scopes(requested_scopes):
+            creds = None
 
     if not creds or not creds.valid:
         if not client_secret.exists():
@@ -48,10 +60,15 @@ def get_credentials(
                 f"Google OAuth client file not found: {client_secret}. "
                 "Create a Desktop OAuth client and place the downloaded JSON there."
             )
+
         flow = InstalledAppFlow.from_client_secrets_file(
-            str(client_secret), list(scopes)
+            str(client_secret), list(requested_scopes)
         )
-        creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+        creds = flow.run_local_server(
+            port=0,
+            access_type="offline",
+            prompt="consent",
+        )
 
     token_file.write_text(creds.to_json(), encoding="utf-8")
     return creds
