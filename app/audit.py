@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from app.audit_engine import generate_report
 from app.crawler.production import ProductionCrawler
 from app.integrations.google_enrichment import enrich as enrich_google
+from app.report.google_section import append_google_section
 from app.storage.db import create_crawl, initialize
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,32 +27,10 @@ def _status(value: object, default: str = "DATA_NOT_AVAILABLE") -> str:
     return value if isinstance(value, str) else default
 
 
-async def run_pipeline(
-    url: str,
-    max_pages: int = 100000,
-    max_depth: int = 50,
-    concurrency: int = 20,
-) -> Path:
-    """Run the site-agnostic SEO audit pipeline.
-
-    Layer 1: the crawler itself — technical/on-page/content/link/schema/image,
-    robots/sitemap discovery, HTTP/redirects, browser-rendered data and timing.
-    Layer 2: free/public enrichment — DNS/RDAP metadata and Common Crawl data.
-    PageSpeed is also public-by-URL and is always attempted through the Google
-    enrichment module, independently of Search Console ownership.
-    Layer 3: optional private Google enrichment — Search Console and GA4.
-    Missing sources are recorded; they never terminate the public audit.
-    """
+async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, concurrency: int = 20) -> Path:
     await initialize()
     crawl_id = await create_crawl(url, max_pages, max_depth, concurrency)
-
-    crawler = ProductionCrawler(
-        crawl_id=crawl_id,
-        start_url=url,
-        max_pages=max_pages,
-        max_depth=max_depth,
-        concurrency=concurrency,
-    )
+    crawler = ProductionCrawler(crawl_id=crawl_id, start_url=url, max_pages=max_pages, max_depth=max_depth, concurrency=concurrency)
     await crawler.run()
 
     crawl_report = RESULTS_DIR / f"crawl_{crawl_id}.json"
@@ -68,31 +47,14 @@ async def run_pipeline(
         "dns_rdap": "PASS" if data.get("site", {}).get("domain") else "DATA_NOT_AVAILABLE",
         "pagespeed": _status(google.get("pagespeed", {}).get("status")),
     }
-
-    private_google = {
-        "search_console": _status(google.get("search_console", {}).get("status")),
-        "sitemaps": _status(google.get("sitemaps", {}).get("status")),
-        "url_inspection": _status(google.get("url_inspection", {}).get("status")),
-        "search_analytics": _status(google.get("search_analytics", {}).get("status")),
-        "ga4": _status(google.get("ga4", {}).get("status"), "NOT_CONFIGURED"),
-    }
-
-    data["pipeline"] = {
-        "status": "PASS",
-        "layers": {
-            "site_crawl": "PASS",
-            "public_external": public_layer,
-            "private_google_enrichment": private_google,
-        },
-    }
+    private_google = {name: _status(google.get(name, {}).get("status"), "NOT_CONFIGURED" if name == "ga4" else "DATA_NOT_AVAILABLE") for name in ("search_console", "sitemaps", "url_inspection", "search_analytics", "ga4")}
+    data["pipeline"] = {"status": "PASS", "layers": {"site_crawl": "PASS", "public_external": public_layer, "private_google_enrichment": private_google}}
     data["google_enrichment"] = google
 
     output = RESULTS_DIR / f"audit_{_safe_name(crawler.start_url)}.json"
-    output.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False, default=str),
-        encoding="utf-8",
-    )
-    generate_report(data, output)
+    output.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    html_path = generate_report(data, output)
+    append_google_section(html_path, google)
     return output
 
 
@@ -103,16 +65,7 @@ def main() -> int:
     parser.add_argument("--max-depth", type=int, default=50)
     parser.add_argument("--concurrency", type=int, default=20)
     args = parser.parse_args()
-
-    output = asyncio.run(
-        run_pipeline(
-            args.url,
-            max_pages=args.max_pages,
-            max_depth=args.max_depth,
-            concurrency=args.concurrency,
-        )
-    )
-
+    output = asyncio.run(run_pipeline(args.url, max_pages=args.max_pages, max_depth=args.max_depth, concurrency=args.concurrency))
     data = json.loads(output.read_text(encoding="utf-8"))
     print("\n========== SEO AUDIT PIPELINE COMPLETE ==========")
     print(f"Site:   {args.url}")
@@ -120,11 +73,10 @@ def main() -> int:
     print(f"Pages:  {len(data.get('pages', []))}")
     print(f"Links:  {len(data.get('links', []))}")
     print(f"Images: {len(data.get('images', []))}")
-    layers = data.get("pipeline", {}).get("layers", {})
-    public = layers.get("public_external", {})
+    public = data.get("pipeline", {}).get("layers", {}).get("public_external", {})
     print(f"Common Crawl: {public.get('common_crawl', 'DATA_NOT_AVAILABLE')}")
     print(f"PageSpeed:    {public.get('pagespeed', 'DATA_NOT_AVAILABLE')}")
-    private = layers.get("private_google_enrichment", {})
+    private = data.get("pipeline", {}).get("layers", {}).get("private_google_enrichment", {})
     for name in ("search_console", "sitemaps", "url_inspection", "search_analytics", "ga4"):
         print(f"Google {name}: {private.get(name, 'DATA_NOT_AVAILABLE')}")
     return 0
