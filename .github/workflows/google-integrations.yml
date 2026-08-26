@@ -30,4 +30,4 @@ jobs:
         run: python -m compileall -q app tests
 
       - name: Run Google integration tests
-        run: pytest -q tests/test_google_integrations.py tests/test_google_integration_imports.py
+        run: pytest -q tests/test_google_integrations.py tests/test_google_integration_imports.py tests/test_google_routes.py
