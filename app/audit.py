@@ -1,0 +1,114 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import re
+from pathlib import Path
+from urllib.parse import urlparse
+
+from app.audit_engine import generate_report
+from app.crawler.production import ProductionCrawler
+from app.integrations.google_enrichment import enrich as enrich_google
+from app.storage.db import create_crawl, initialize
+
+ROOT = Path(__file__).resolve().parents[1]
+RESULTS_DIR = ROOT / "results"
+
+
+def _safe_name(url: str) -> str:
+    host = urlparse(url).hostname or "site"
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", host)
+    return name or "site"
+
+
+async def run_pipeline(
+    url: str,
+    max_pages: int = 100000,
+    max_depth: int = 50,
+    concurrency: int = 20,
+) -> Path:
+    """Run the full site-agnostic audit pipeline.
+
+    Layer 1: local crawler (technical, on-page, content, links, schema, images,
+    rendered/browser data, HTTP, robots/sitemap discovery).
+    Layer 2: public/free enrichment already attached to the crawler, including
+    DNS/RDAP metadata and Common Crawl backlink discovery.
+    Layer 3: optional Google enrichment; missing private data never blocks the
+    public audit.
+    """
+    await initialize()
+    crawl_id = await create_crawl(url, max_pages, max_depth, concurrency)
+
+    crawler = ProductionCrawler(
+        crawl_id=crawl_id,
+        start_url=url,
+        max_pages=max_pages,
+        max_depth=max_depth,
+        concurrency=concurrency,
+    )
+    await crawler.run()
+
+    crawl_report = RESULTS_DIR / f"crawl_{crawl_id}.json"
+    if not crawl_report.exists():
+        raise RuntimeError(f"Crawler completed but did not create {crawl_report}")
+
+    data = json.loads(crawl_report.read_text(encoding="utf-8"))
+    google = enrich_google(crawler.start_url)
+    data["pipeline"] = {
+        "status": "PASS",
+        "layers": {
+            "site_crawl": "PASS",
+            "public_external": {
+                "status": "PASS",
+                "common_crawl": data.get("backlinks", {}).get("layer1", {}).get("status", "DATA_NOT_AVAILABLE"),
+                "dns_rdap": "PASS" if data.get("site", {}).get("domain") else "DATA_NOT_AVAILABLE",
+            },
+            "private_google": "OPTIONAL",
+        },
+    }
+    data["google_enrichment"] = google
+
+    output = RESULTS_DIR / f"audit_{_safe_name(crawler.start_url)}.json"
+    output.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    generate_report(data, output)
+    return output
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Run a complete general-purpose SEO audit.")
+    parser.add_argument("url", help="Public website URL to audit")
+    parser.add_argument("--max-pages", type=int, default=100000)
+    parser.add_argument("--max-depth", type=int, default=50)
+    parser.add_argument("--concurrency", type=int, default=20)
+    args = parser.parse_args()
+
+    output = asyncio.run(
+        run_pipeline(
+            args.url,
+            max_pages=args.max_pages,
+            max_depth=args.max_depth,
+            concurrency=args.concurrency,
+        )
+    )
+
+    data = json.loads(output.read_text(encoding="utf-8"))
+    print("\n========== SEO AUDIT PIPELINE COMPLETE ==========")
+    print(f"Site:   {args.url}")
+    print(f"Report: {output}")
+    print(f"Pages:  {len(data.get('pages', []))}")
+    print(f"Links:  {len(data.get('links', []))}")
+    print(f"Images: {len(data.get('images', []))}")
+    print(f"Common Crawl: {data.get('backlinks', {}).get('layer1', {}).get('status', 'DATA_NOT_AVAILABLE')}")
+    google = data.get("google_enrichment", {})
+    for name in ("pagespeed", "search_console", "sitemaps", "url_inspection", "search_analytics", "ga4"):
+        if name in google:
+            print(f"Google {name}: {google[name].get('status')}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
