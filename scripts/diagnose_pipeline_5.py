@@ -20,101 +20,80 @@ def section(n, name):
 
 
 async def main(url: str, max_pages: int = 5):
-    from app.crawler.production import ProductionCrawler
+    from app.crawler.production import ProductionCrawler, site_metadata
+    from app.integrations.common_crawl_runtime import collect as collect_common_crawl
+    from app.integrations.google_enrichment import enrich as enrich_google
     from app.storage.db import create_crawl, initialize
 
     timings = {}
     details = {}
     total_start = ts()
-
     await initialize()
 
-    section(1, "CRAWLER / DISCOVERY + HTTP + ANALYSIS")
+    section(1, "CRAWLER / DISCOVERY + HTTP + ANALYSIS + REPORT")
     t = ts()
     crawl_id = await create_crawl(url, max_pages, 50, 5)
-    crawler = ProductionCrawler(
-        crawl_id=crawl_id,
-        start_url=url,
-        max_pages=max_pages,
-        max_depth=50,
-        concurrency=5,
-    )
+    crawler = ProductionCrawler(crawl_id=crawl_id, start_url=url, max_pages=max_pages, max_depth=50, concurrency=5)
     await crawler.run()
     timings["crawler_total"] = ts() - t
     details["crawl_id"] = crawl_id
-    print(f"Completed crawler layer: {timings['crawler_total']:.2f}s")
-    print(f"Crawl result: {ROOT / 'results' / f'crawl_{crawl_id}.json'}")
-
     crawl_file = ROOT / "results" / f"crawl_{crawl_id}.json"
     if crawl_file.exists():
         data = json.loads(crawl_file.read_text(encoding="utf-8"))
-        details["pages"] = len(data.get("pages", []))
-        details["links"] = len(data.get("links", []))
-        details["images"] = len(data.get("images", []))
-        print(f"Pages: {details['pages']} | Links: {details['links']} | Images: {details['images']}")
     else:
         data = {}
+    details["pages"] = len(data.get("pages", []))
+    details["links"] = len(data.get("links", []))
+    details["images"] = len(data.get("images", []))
+    print(f"Completed: {timings['crawler_total']:.2f}s | Pages: {details['pages']} | Links: {details['links']} | Images: {details['images']}")
 
     section(2, "COMMON CRAWL / PUBLIC EXTERNAL")
     t = ts()
     try:
-        from app.integrations.common_crawl import CommonCrawlClient
-        client = CommonCrawlClient()
-        result = await client.analyze_domain(urlparse(url).hostname or "")
+        result = collect_common_crawl(url)
         details["common_crawl"] = result
-        status = result.get("status", "PASS") if isinstance(result, dict) else "PASS"
+        status = result.get("status", "DATA_NOT_AVAILABLE")
     except Exception as exc:
         status = "ERROR"
         details["common_crawl_error"] = f"{type(exc).__name__}: {exc}"
     timings["common_crawl"] = ts() - t
-    print(f"Status: {status}")
-    print(f"Layer time: {timings['common_crawl']:.2f}s")
+    print(f"Status: {status} | Layer time: {timings['common_crawl']:.2f}s")
 
     section(3, "DNS / RDAP / PUBLIC DOMAIN DATA")
     t = ts()
     try:
-        from app.integrations.domain_intelligence import DomainIntelligence
-        result = DomainIntelligence().analyze(url)
+        result = site_metadata(url, {})
         details["domain_intelligence"] = result
-        status = "PASS"
+        status = "PASS" if result.get("hostname") else "DATA_NOT_AVAILABLE"
     except Exception as exc:
         status = "ERROR"
         details["domain_intelligence_error"] = f"{type(exc).__name__}: {exc}"
     timings["dns_rdap"] = ts() - t
-    print(f"Status: {status}")
-    print(f"Layer time: {timings['dns_rdap']:.2f}s")
+    print(f"Status: {status} | Layer time: {timings['dns_rdap']:.2f}s")
 
     section(4, "PAGESPEED INSIGHTS (PUBLIC)")
     t = ts()
     try:
-        from app.integrations.google_pagespeed import PageSpeedClient
-        result = PageSpeedClient().analyze(
-            url,
-            strategy="mobile",
-            categories=["performance", "accessibility", "best-practices", "seo"],
-        )
-        cats = result.get("lighthouseResult", {}).get("categories", {})
-        details["pagespeed"] = {k: v.get("score") for k, v in cats.items()}
-        status = "PASS"
+        google = enrich_google(url)
+        result = google.get("pagespeed", {})
+        details["pagespeed"] = result
+        status = result.get("status", "DATA_NOT_AVAILABLE")
+        details["google_for_timing"] = google
     except Exception as exc:
         status = "ERROR"
         details["pagespeed_error"] = f"{type(exc).__name__}: {exc}"
     timings["pagespeed"] = ts() - t
-    print(f"Status: {status}")
-    print(f"Layer time: {timings['pagespeed']:.2f}s")
+    print(f"Status: {status} | Layer time: {timings['pagespeed']:.2f}s")
 
     section(5, "GOOGLE PRIVATE ENRICHMENT")
     t = ts()
     try:
-        from app.integrations.google_enrichment import enrich
-        google = enrich(url)
+        google = details.get("google_for_timing") or enrich_google(url)
         details["google"] = google
-        status = "PASS"
         for key, value in google.items():
             if isinstance(value, dict):
                 print(f"{key}: {value.get('status', 'UNKNOWN')}")
     except Exception as exc:
-        status = "ERROR"
         details["google_error"] = f"{type(exc).__name__}: {exc}"
     timings["google"] = ts() - t
     print(f"Layer time: {timings['google']:.2f}s")
@@ -123,7 +102,6 @@ async def main(url: str, max_pages: int = 5):
     section(6, "TIMING SUMMARY")
     for name, seconds in timings.items():
         print(f"{name:24} {seconds:8.2f}s")
-
     slowest = max((k for k in timings if k != "total"), key=timings.get)
     print(f"\nBOTTLENECK: {slowest} ({timings[slowest]:.2f}s)")
 
