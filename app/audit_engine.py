@@ -202,6 +202,71 @@ def _crawl_coverage_class(score):
     return "score-red"
 
 
+def _status_class(status):
+    status = str(status or "").upper()
+    if status == "PASS" or status in {"SUCCESS", "CONFIRMED"}:
+        return "status-pass"
+    if status in {"DATA_NOT_AVAILABLE", "NOT_CONFIGURED", "SKIPPED", "NOT_FOUND", "TIMEOUT"}:
+        return "status-muted"
+    return "status-error"
+
+
+def _status_badge(status):
+    status = str(status or "DATA_NOT_AVAILABLE")
+    return f'<span class="badge {_status_class(status)}">{escape(status)}</span>'
+
+
+def _kv_rows(items):
+    rows = []
+    for key, value in items:
+        if isinstance(value, (dict, list)):
+            rendered = escape(json.dumps(value, indent=2, ensure_ascii=False, default=str))
+            rendered = f'<pre>{rendered}</pre>'
+        else:
+            rendered = escape(str(value))
+        rows.append(f"<tr><th>{escape(str(key))}</th><td>{rendered}</td></tr>")
+    return "".join(rows)
+
+
+def _google_section(data):
+    google = data.get("google_enrichment", {}) or {}
+    if not google:
+        return '<div class="site"><h2>Google &amp; Public API Enrichment</h2><p>DATA NOT AVAILABLE: no enrichment results were attached to this report.</p></div>'
+
+    rows = []
+    for name in ("oauth", "pagespeed", "search_console", "sitemaps", "url_inspection", "search_analytics", "ga4"):
+        item = google.get(name) or {"status": "DATA_NOT_AVAILABLE", "reason": "No result returned."}
+        status = item.get("status", "DATA_NOT_AVAILABLE")
+        rows.append(f"<tr><td><b>{escape(name.replace('_', ' ').title())}</b></td><td>{_status_badge(status)}</td><td>{escape(str(item.get('reason') or item.get('error') or ''))}</td></tr>")
+
+    detail_blocks = []
+    for name in ("pagespeed", "search_console", "sitemaps", "url_inspection", "search_analytics", "ga4"):
+        item = google.get(name)
+        if not item:
+            continue
+        status = item.get("status", "DATA_NOT_AVAILABLE")
+        detail = {k: v for k, v in item.items() if k not in {"status", "reason", "error"}}
+        heading = name.replace('_', ' ').title()
+        body = f"<p>Status: {_status_badge(status)}</p>"
+        if item.get("reason"):
+            body += f"<p><b>Reason:</b> {escape(str(item['reason']))}</p>"
+        if item.get("error"):
+            body += f"<p><b>Error:</b> {escape(str(item['error']))}</p>"
+        if detail:
+            body += f"<table>{_kv_rows(detail)}</table>"
+        detail_blocks.append(f"<div class=\"api-card\"><h3>{escape(heading)}</h3>{body}</div>")
+
+    return f'''<div class="site"><h2>Google &amp; Public API Enrichment</h2><table><tr><th>Source</th><th>Status</th><th>Reason / Error</th></tr>{''.join(rows)}</table><div class="api-grid">{''.join(detail_blocks)}</div></div>'''
+
+
+def _public_section(data):
+    pipeline = data.get("pipeline", {}) or {}
+    public = (pipeline.get("layers", {}) or {}).get("public_external", {}) or {}
+    domain = (data.get("site", {}) or {}).get("domain", {}) or {}
+    layer1 = (data.get("backlinks", {}) or {}).get("layer1", {}) or {}
+    return f'''<div class="site"><h2>Public / External Data Sources</h2><table><tr><th>Source</th><th>Status</th><th>Available data</th></tr><tr><td>DNS / RDAP</td><td>{_status_badge('PASS' if domain else 'DATA_NOT_AVAILABLE')}</td><td>{escape(json.dumps(domain, ensure_ascii=False, default=str))}</td></tr><tr><td>Common Crawl</td><td>{_status_badge(layer1.get('status', 'DATA_NOT_AVAILABLE'))}</td><td>{escape(json.dumps({k:v for k,v in layer1.items() if k != 'backlinks'}, ensure_ascii=False, default=str))}</td></tr><tr><td>PageSpeed Insights</td><td>{_status_badge(public.get('pagespeed', 'DATA_NOT_AVAILABLE'))}</td><td>See Google &amp; Public API Enrichment section below for scores and response data.</td></tr></table></div>'''
+
+
 def html_report(audit_data, crawl_data):
     s = audit_data["summary"]
     site = audit_data.get("site", {})
@@ -246,9 +311,12 @@ def html_report(audit_data, crawl_data):
         l2_rows.append('<tr><td colspan="4">No confirmed page-level backlinks found.</td></tr>')
     backlink_section = f'''<div class="site"><h2>Backlinks</h2><p><b>Provider:</b> Common Crawl</p><p><b>Layer 1 Status:</b> {escape(str(layer1.get("status", "unknown")))}</p><p><b>Total Backlinks:</b> {int(layer1.get("total_backlinks", 0) or 0)}</p><p><b>Referring Domains:</b> {int(layer1.get("referring_domains", 0) or 0)}</p><h3>Referring Domains</h3><table><tr><th>Source Domain</th><th>Target</th></tr>{''.join(l1_rows)}</table><h3>Layer 2 — Confirmed Page-Level Links</h3><p><b>Status:</b> {escape(str(layer2.get("status", "unknown")))} &nbsp; <b>Confirmed Links:</b> {int(layer2.get("links_found", 0) or 0)}</p><table><tr><th>Source URL</th><th>Target URL</th><th>Anchor Text</th><th>Rel</th></tr>{''.join(l2_rows)}</table></div>'''
 
+    public_section = _public_section(crawl_data)
+    google_section = _google_section(crawl_data)
+
     return f'''<!doctype html><html><head><meta charset="utf-8"><title>SEO Audit Report - Crawl {crawl_data.get('crawl_id')}</title><style>
-body{{font-family:Arial,sans-serif;background:#f4f5f7;color:#222;margin:0;padding:35px}}.container{{max-width:1400px;margin:auto;background:#fff;padding:35px}}.metrics{{display:flex;gap:20px;margin:25px 0}}.metric{{flex:1;border:1px solid #ddd;padding:20px;border-radius:8px}}.metric strong{{display:block;font-size:30px;margin-top:8px}}.score-red{{color:#dc2626!important}}.score-orange{{color:#d97706!important}}.score-green{{color:#16a34a!important}}.pages-blue{{color:#2563eb!important}}.site{{border:1px solid #ddd;padding:20px;margin-bottom:30px}}table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{border:1px solid #ddd;padding:12px;text-align:left;vertical-align:top}}th{{background:#eee}}a{{color:#2563eb;text-decoration:underline}}a:hover{{text-decoration:none}}.legend{{font-size:13px;color:#666;margin-top:8px}}
-</style></head><body><div class="container"><h1>SEO Audit Report</h1><p>Crawl ID: {crawl_data.get('crawl_id')}</p><div class="metrics"><div class="metric">SEO Score<strong class="{_score_class(s['seo_score'])}">{s['seo_score']}/100</strong></div><div class="metric">Site Health<strong class="{_score_class(s['site_health'])}">{s['site_health']}/100</strong></div><div class="metric">Pages Crawled<strong class="{_crawl_coverage_class(s['crawl_coverage_score'])}">{s['crawl_coverage_score']}/10</strong></div></div><div class="site"><h2>Site-Wide Information</h2>{site_lines}</div>{backlink_section}<h2>Issues by Page</h2><table><tr><th>Page</th><th>Problems / Opportunities</th></tr>{''.join(rows)}</table></div></body></html>'''
+body{{font-family:Arial,sans-serif;background:#f4f5f7;color:#222;margin:0;padding:35px}}.container{{max-width:1400px;margin:auto;background:#fff;padding:35px}}.metrics{{display:flex;gap:20px;margin:25px 0}}.metric{{flex:1;border:1px solid #ddd;padding:20px;border-radius:8px}}.metric strong{{display:block;font-size:30px;margin-top:8px}}.score-red{{color:#dc2626!important}}.score-orange{{color:#d97706!important}}.score-green{{color:#16a34a!important}}.pages-blue{{color:#2563eb!important}}.site{{border:1px solid #ddd;padding:20px;margin-bottom:30px}}table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{border:1px solid #ddd;padding:12px;text-align:left;vertical-align:top}}th{{background:#eee}}a{{color:#2563eb;text-decoration:underline}}a:hover{{text-decoration:none}}.legend{{font-size:13px;color:#666;margin-top:8px}}.badge{{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;font-weight:700}}.status-pass{{background:#dcfce7;color:#166534}}.status-muted{{background:#f3f4f6;color:#374151}}.status-error{{background:#fee2e2;color:#991b1b}}.api-grid{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;margin-top:18px}}.api-card{{border:1px solid #ddd;border-radius:8px;padding:16px;background:#fafafa}}.api-card h3{{margin-top:0}}pre{{white-space:pre-wrap;word-break:break-word;margin:0;font-size:12px}}
+</style></head><body><div class="container"><h1>SEO Audit Report</h1><p>Crawl ID: {crawl_data.get('crawl_id')}</p><div class="metrics"><div class="metric">SEO Score<strong class="{_score_class(s['seo_score'])}">{s['seo_score']}/100</strong></div><div class="metric">Site Health<strong class="{_score_class(s['site_health'])}">{s['site_health']}/100</strong></div><div class="metric">Pages Crawled<strong class="{_crawl_coverage_class(s['crawl_coverage_score'])}">{s['crawl_coverage_score']}/10</strong></div></div><div class="site"><h2>Site-Wide Information</h2>{site_lines}</div>{public_section}{google_section}{backlink_section}<h2>Issues by Page</h2><table><tr><th>Page</th><th>Problems / Opportunities</th></tr>{''.join(rows)}</table></div></body></html>'''
 
 
 def generate_report(data, source_path):
