@@ -7,10 +7,10 @@ from typing import Any, Literal
 from google.auth.transport.requests import AuthorizedSession
 from google.oauth2 import service_account
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-DEFAULT_SERVICE_ACCOUNT = (
-    BASE_DIR / "credentials" / "google_indexing_service_account.json"
-)
+# Keep private credentials outside the Git repository.
+REPO_DIR = Path(__file__).resolve().parents[2]
+WORKSPACE_DIR = REPO_DIR.parent
+DEFAULT_SERVICE_ACCOUNT = WORKSPACE_DIR / "credentials" / "google_indexing_service_account.json"
 INDEXING_SCOPE = "https://www.googleapis.com/auth/indexing"
 PUBLISH_ENDPOINT = "https://indexing.googleapis.com/v3/urlNotifications:publish"
 METADATA_ENDPOINT = "https://indexing.googleapis.com/v3/urlNotifications/metadata"
@@ -29,10 +29,7 @@ class IndexingClient:
     ) -> None:
         credential_path = Path(
             service_account_path
-            or os.getenv(
-                "GOOGLE_INDEXING_SERVICE_ACCOUNT_FILE",
-                DEFAULT_SERVICE_ACCOUNT,
-            )
+            or os.getenv("GOOGLE_INDEXING_SERVICE_ACCOUNT_FILE", DEFAULT_SERVICE_ACCOUNT)
         )
         self.timeout = timeout
 
@@ -47,8 +44,7 @@ class IndexingClient:
             )
 
         credentials = service_account.Credentials.from_service_account_file(
-            str(credential_path),
-            scopes=[INDEXING_SCOPE],
+            str(credential_path), scopes=[INDEXING_SCOPE]
         )
         self.session = AuthorizedSession(credentials)
         self.credential_path = credential_path
@@ -60,7 +56,6 @@ class IndexingClient:
     ) -> dict[str, Any]:
         if notification_type not in {"URL_UPDATED", "URL_DELETED"}:
             raise ValueError("notification_type must be URL_UPDATED or URL_DELETED")
-
         response = self.session.post(
             PUBLISH_ENDPOINT,
             json={"url": url, "type": notification_type},
@@ -71,9 +66,7 @@ class IndexingClient:
 
     def metadata(self, url: str) -> dict[str, Any]:
         response = self.session.get(
-            METADATA_ENDPOINT,
-            params={"url": url},
-            timeout=self.timeout,
+            METADATA_ENDPOINT, params={"url": url}, timeout=self.timeout
         )
         response.raise_for_status()
         return response.json()
