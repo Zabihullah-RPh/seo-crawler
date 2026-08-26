@@ -16,48 +16,71 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "results"
 
 
+def _result(status: str, **details: Any) -> dict[str, Any]:
+    return {"status": status, **details}
+
+
+def _error(exc: Exception) -> dict[str, Any]:
+    return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 def run_audit(site_url: str) -> dict[str, Any]:
     site_url = site_url.rstrip("/") + "/"
-    results: dict[str, Any] = {"site_url": site_url}
+    results: dict[str, Any] = {
+        "site_url": site_url,
+        "oauth": _result("PASS"),
+    }
 
-    creds = get_credentials()
-    results["oauth"] = {"status": "PASS"}
+    try:
+        creds = get_credentials()
+    except Exception as exc:
+        return {
+            "site_url": site_url,
+            "oauth": _result("ERROR", **_error(exc)),
+            "search_console": _result("DATA_NOT_AVAILABLE", reason="Google OAuth authentication was not available."),
+            "sitemaps": _result("DATA_NOT_AVAILABLE", reason="Google OAuth authentication was not available."),
+            "url_inspection": _result("DATA_NOT_AVAILABLE", reason="Google OAuth authentication was not available."),
+            "search_analytics": _result("DATA_NOT_AVAILABLE", reason="Google OAuth authentication was not available."),
+            "pagespeed": _result("DATA_NOT_AVAILABLE", reason="Google OAuth authentication was not available."),
+            "ga4": _result("NOT_CONFIGURED", reason="Google OAuth authentication was not available."),
+        }
+
     gsc = SearchConsoleClient(credentials=creds)
 
-    # Search Console is optional for a site that has not been added to this
-    # Google account. Other Google services can still be tested/run.
-    sites = gsc.list_sites()
-    matching = [
-        s for s in sites
-        if s.get("siteUrl", "").rstrip("/") + "/" == site_url
-    ]
+    # Search Console data is only available when this account has access to the property.
+    try:
+        sites = gsc.list_sites()
+        matching = [
+            s for s in sites
+            if s.get("siteUrl", "").rstrip("/") + "/" == site_url
+        ]
+    except Exception as exc:
+        matching = []
+        results["search_console"] = _result("ERROR", **_error(exc))
+
     property_info = matching[0] if matching else None
 
-    if property_info:
-        results["search_console"] = {"status": "PASS", "property": property_info}
+    if property_info and "search_console" not in results:
+        results["search_console"] = _result("PASS", property=property_info)
 
         try:
             sitemaps = gsc.list_sitemaps(site_url)
-            results["sitemaps"] = {
-                "status": "PASS",
-                "count": len(sitemaps),
-                "items": sitemaps,
-            }
+            results["sitemaps"] = _result("PASS", count=len(sitemaps), items=sitemaps)
         except Exception as exc:
-            results["sitemaps"] = {"status": "FAIL", "error": str(exc)}
+            results["sitemaps"] = _result("ERROR", **_error(exc))
 
         try:
             inspection = URLInspectionClient(credentials=creds).inspect(site_url, site_url)
             inspection_result = inspection.get("inspectionResult", {})
             index_status = inspection_result.get("indexStatusResult", {})
-            results["url_inspection"] = {
-                "status": "PASS",
-                "verdict": inspection_result.get("verdict"),
-                "coverage_state": index_status.get("coverageState"),
-                "indexing_state": index_status.get("indexingState"),
-            }
+            results["url_inspection"] = _result(
+                "PASS",
+                verdict=inspection_result.get("verdict"),
+                coverage_state=index_status.get("coverageState"),
+                indexing_state=index_status.get("indexingState"),
+            )
         except Exception as exc:
-            results["url_inspection"] = {"status": "FAIL", "error": str(exc)}
+            results["url_inspection"] = _result("ERROR", **_error(exc))
 
         try:
             search_rows = gsc.search_analytics(
@@ -65,31 +88,26 @@ def run_audit(site_url: str) -> dict[str, Any]:
                 dimensions=["query"],
                 row_limit=1000,
             )
-            results["search_analytics"] = {
-                "status": "PASS",
-                "rows": search_rows,
-            }
+            results["search_analytics"] = _result("PASS", rows=search_rows)
         except Exception as exc:
-            results["search_analytics"] = {"status": "FAIL", "error": str(exc)}
+            results["search_analytics"] = _result("ERROR", **_error(exc))
     else:
-        results["search_console"] = {
-            "status": "SKIPPED",
-            "reason": "Site is not available in Search Console for this Google account.",
-        }
-        results["sitemaps"] = {
-            "status": "SKIPPED",
-            "reason": "Requires a Search Console property for this account.",
-        }
-        results["url_inspection"] = {
-            "status": "SKIPPED",
-            "reason": "Requires a Search Console property for this account.",
-        }
-        results["search_analytics"] = {
-            "status": "SKIPPED",
-            "reason": "Requires a Search Console property for this account.",
-        }
+        reason = "Property is not accessible in Search Console for the authenticated Google account."
+        results.setdefault("search_console", _result("DATA_NOT_AVAILABLE", reason=reason))
+        results["sitemaps"] = _result(
+            "DATA_NOT_AVAILABLE",
+            reason="Requires accessible Search Console property data for this site.",
+        )
+        results["url_inspection"] = _result(
+            "DATA_NOT_AVAILABLE",
+            reason="Requires accessible Search Console property data for this site.",
+        )
+        results["search_analytics"] = _result(
+            "DATA_NOT_AVAILABLE",
+            reason="Requires accessible Search Console property data for this site.",
+        )
 
-    # PageSpeed does not require the site to be a Search Console property.
+    # PageSpeed is independent of Search Console property access.
     try:
         token = getattr(creds, "token", None)
         pagespeed = PageSpeedClient().analyze(
@@ -99,17 +117,18 @@ def run_audit(site_url: str) -> dict[str, Any]:
             oauth_token=token,
         )
         categories = pagespeed.get("lighthouseResult", {}).get("categories", {})
-        results["pagespeed"] = {
-            "status": "PASS",
-            "performance": categories.get("performance", {}).get("score"),
-            "accessibility": categories.get("accessibility", {}).get("score"),
-            "best_practices": categories.get("best-practices", {}).get("score"),
-            "seo": categories.get("seo", {}).get("score"),
-        }
+        results["pagespeed"] = _result(
+            "PASS",
+            performance=categories.get("performance", {}).get("score"),
+            accessibility=categories.get("accessibility", {}).get("score"),
+            best_practices=categories.get("best-practices", {}).get("score"),
+            seo=categories.get("seo", {}).get("score"),
+        )
     except Exception as exc:
-        results["pagespeed"] = {"status": "FAIL", "error": str(exc)}
+        results["pagespeed"] = _result("ERROR", **_error(exc))
 
-    # GA4 is optional unless a property ID is configured.
+    # GA4 is opt-in via property ID because GA4 properties are account-specific,
+    # not inferable from an arbitrary website URL.
     property_id = os.getenv("GA4_PROPERTY_ID")
     if property_id:
         try:
@@ -119,18 +138,14 @@ def run_audit(site_url: str) -> dict[str, Any]:
                 metrics=["activeUsers", "sessions", "screenPageViews"],
                 limit=30,
             )
-            results["ga4"] = {
-                "status": "PASS",
-                "property_id": property_id,
-                "report": report,
-            }
+            results["ga4"] = _result("PASS", property_id=property_id, report=report)
         except Exception as exc:
-            results["ga4"] = {"status": "FAIL", "error": str(exc)}
+            results["ga4"] = _result("ERROR", **_error(exc), property_id=property_id)
     else:
-        results["ga4"] = {
-            "status": "SKIPPED",
-            "reason": "Set GA4_PROPERTY_ID to include GA4 data in the one-command audit.",
-        }
+        results["ga4"] = _result(
+            "NOT_CONFIGURED",
+            reason="No GA4 property ID was configured for this audit.",
+        )
 
     return results
 
@@ -141,11 +156,7 @@ def main() -> int:
         return 2
 
     site_url = sys.argv[1]
-    try:
-        results = run_audit(site_url)
-    except Exception as exc:
-        print(f"AUDIT FAILED: {type(exc).__name__}: {exc}")
-        return 1
+    results = run_audit(site_url)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     safe_name = site_url.replace("https://", "").replace("http://", "").rstrip("/")
@@ -153,12 +164,12 @@ def main() -> int:
     output = OUTPUT_DIR / f"google_audit_{safe_name}.json"
     output.write_text(json.dumps(results, indent=2), encoding="utf-8")
 
-    statuses = {name: data.get("status") for name, data in results.items() if isinstance(data, dict) and "status" in data}
     print("GOOGLE SEO AUDIT")
     print(f"Site: {site_url}")
     print(f"Report: {output}")
-    for name, status in statuses.items():
-        print(f"{name}: {status}")
+    for name, data in results.items():
+        if isinstance(data, dict) and "status" in data:
+            print(f"{name}: {data['status']}")
     return 0
 
 
