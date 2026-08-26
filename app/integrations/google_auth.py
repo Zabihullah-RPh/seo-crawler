@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Iterable
@@ -60,8 +61,8 @@ def get_credentials(
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
             creds = None
 
-    # IMPORTANT: check the scopes before attempting refresh. A stale token
-    # that lacks a newly requested scope must be re-authorized, not refreshed.
+    # Check scopes BEFORE attempting refresh. A stale token that lacks a
+    # newly requested scope must be re-authorized, not refreshed.
     if creds and hasattr(creds, "has_scopes") and not creds.has_scopes(requested_scopes):
         creds = None
 
