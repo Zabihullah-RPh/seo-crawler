@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from app.audit_engine import generate_report
 from app.crawler.production import ProductionCrawler
 from app.integrations.google_enrichment import enrich as enrich_google
-from app.report.google_section import append_google_section
+from app.report.pipeline_report import write_pipeline_report
 from app.storage.db import create_crawl, initialize
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -53,8 +53,10 @@ async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, c
 
     output = RESULTS_DIR / f"audit_{_safe_name(crawler.start_url)}.json"
     output.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-    html_path = generate_report(data, output)
-    append_google_section(html_path, google)
+    generated_html = generate_report(data, output)
+    final_html = RESULTS_DIR / f"pipeline_report_{crawl_id}.html"
+    write_pipeline_report(generated_html, final_html, google)
+    print(f"Final HTML report: {final_html}")
     return output
 
 
@@ -69,7 +71,7 @@ def main() -> int:
     data = json.loads(output.read_text(encoding="utf-8"))
     print("\n========== SEO AUDIT PIPELINE COMPLETE ==========")
     print(f"Site:   {args.url}")
-    print(f"Report: {output}")
+    print(f"JSON:   {output}")
     print(f"Pages:  {len(data.get('pages', []))}")
     print(f"Links:  {len(data.get('links', []))}")
     print(f"Images: {len(data.get('images', []))}")
