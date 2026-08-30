@@ -1,4 +1,9 @@
-"""Layer 2 live backlink verification."""
+"""Layer 2 live backlink verification.
+
+Layer 1 Common Crawl remains the broad discovery source. Layer 2 only verifies
+candidate referring domains with bounded time/page limits so a slow referring
+site cannot block the entire SEO audit.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -11,9 +16,10 @@ from bs4 import BeautifulSoup
 from app.crawler.http import HTTPClient
 from app.utils.urls import normalize_url
 
-DEFAULT_TIMEOUT_SECONDS = 300
-DEFAULT_CONCURRENCY = 32
-BATCH_SIZE = 32
+DEFAULT_TIMEOUT_SECONDS = 20
+DEFAULT_CONCURRENCY = 16
+BATCH_SIZE = 16
+PAGE_LIMIT = 30
 
 
 def _host(url: str) -> str:
@@ -113,7 +119,7 @@ async def _sitemaps(http: HTTPClient, domain: str, deadline: float) -> list[str]
             soup = BeautifulSoup(text, "xml")
             maps.extend(urljoin(final, loc.get_text(" ", strip=True)) for loc in soup.find_all("loc") if loc.get_text(strip=True))
     pages, pending, seen_maps, seen_pages = [], deque(dict.fromkeys(maps)), set(), set()
-    while pending and time.monotonic() < deadline:
+    while pending and time.monotonic() < deadline and len(pages) < PAGE_LIMIT:
         sm = _canonical(pending.popleft())
         if not sm or sm in seen_maps:
             continue
@@ -129,11 +135,13 @@ async def _sitemaps(http: HTTPClient, domain: str, deadline: float) -> list[str]
             pending.extend(locs)
         else:
             for href in locs:
+                if len(pages) >= PAGE_LIMIT:
+                    break
                 href = _canonical(href)
                 if href and _same_domain(href, domain) and href not in seen_pages:
                     seen_pages.add(href)
                     pages.append(href)
-    return pages
+    return pages[:PAGE_LIMIT]
 
 
 async def investigate_referring_domain(http: HTTPClient, source_domain: str, target_domain: str, *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS, progress_callback=None) -> dict:
@@ -146,9 +154,9 @@ async def investigate_referring_domain(http: HTTPClient, source_domain: str, tar
         queue.appendleft(u)
 
     attempted = 0
-    while queue and time.monotonic() < deadline:
+    while queue and time.monotonic() < deadline and attempted < PAGE_LIMIT:
         batch = []
-        while queue and len(batch) < BATCH_SIZE and time.monotonic() < deadline:
+        while queue and len(batch) < BATCH_SIZE and time.monotonic() < deadline and attempted + len(batch) < PAGE_LIMIT:
             u = _canonical(queue.popleft())
             if u and u not in checked:
                 checked.add(u)
@@ -178,16 +186,18 @@ async def investigate_referring_domain(http: HTTPClient, source_domain: str, tar
                 for hit in hits:
                     hit["layer"] = 2
                     hit["found_via"] = "live_crawl"
-                return {"status":"confirmed","referring_domain":source_domain,"target_domain":target_domain,"pages_checked":attempted,"elapsed_seconds":round(elapsed,2),"links_found":len(hits),"backlinks":hits}
+                return {"status": "confirmed", "referring_domain": source_domain, "target_domain": target_domain, "pages_checked": attempted, "elapsed_seconds": round(elapsed, 2), "links_found": len(hits), "backlinks": hits}
             new_urls.extend(internal)
             if progress_callback:
                 progress_callback(attempted, time.monotonic() - started, len(queue))
         for nxt in new_urls:
+            if len(checked) >= PAGE_LIMIT:
+                break
             if nxt not in checked:
                 queue.append(nxt)
 
     elapsed = time.monotonic() - started
-    return {"status":"timeout" if time.monotonic() >= deadline else "not_found","referring_domain":source_domain,"target_domain":target_domain,"pages_checked":attempted,"elapsed_seconds":round(elapsed,2),"links_found":0,"backlinks":[]}
+    return {"status": "timeout" if time.monotonic() >= deadline else "page_limit", "referring_domain": source_domain, "target_domain": target_domain, "pages_checked": attempted, "elapsed_seconds": round(elapsed, 2), "links_found": 0, "backlinks": []}
 
 
 async def investigate_layer2(url: str, layer1: dict, *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS, concurrency: int = DEFAULT_CONCURRENCY) -> dict:
@@ -197,22 +207,26 @@ async def investigate_layer2(url: str, layer1: dict, *, timeout_seconds: float =
     for item in layer1.get("backlinks", []) or []:
         d = str(item.get("referring_domain") or "").strip().lower()
         if d and d not in seen and d != target_domain:
-            seen.add(d); domains.append(d)
+            seen.add(d)
+            domains.append(d)
     if not domains:
-        return {"status":"no_referring_domains","target_domain":target_domain,"layer1_referring_domains":0,"domains_investigated":0,"links_found":0,"backlinks":[]}
+        return {"status": "no_referring_domains", "target_domain": target_domain, "layer1_referring_domains": 0, "domains_investigated": 0, "links_found": 0, "backlinks": []}
 
     http = HTTPClient(concurrency=max(1, int(concurrency)))
     try:
-        groups = await asyncio.gather(*(investigate_referring_domain(http,d,target_domain,timeout_seconds=timeout_seconds) for d in domains), return_exceptions=True)
+        groups = await asyncio.gather(*(investigate_referring_domain(http, d, target_domain, timeout_seconds=timeout_seconds) for d in domains), return_exceptions=True)
     finally:
         await http.close()
-    links=[]; domain_status=[]; statuses=set()
-    for d,g in zip(domains,groups):
-        if isinstance(g,Exception):
-            g={"status":"error","pages_checked":0,"elapsed_seconds":0,"links_found":0,"backlinks":[]}
-        valid=[x for x in g.get("backlinks",[]) if x.get("target_url")]
-        links.extend([{**x,"referring_domain":d} for x in valid])
-        st=str(g.get("status") or "error"); statuses.add(st)
-        domain_status.append({"referring_domain":d,"status":st,"pages_checked":g.get("pages_checked",0),"elapsed_seconds":g.get("elapsed_seconds",0),"links_found":len(valid)})
-    overall="confirmed" if links else "timeout" if "timeout" in statuses else "error" if "error" in statuses else "blocked" if "blocked" in statuses else "not_found"
-    return {"status":overall,"target_domain":target_domain,"layer1_referring_domains":len(domains),"domains_investigated":len(domains),"links_found":len(links),"limits":{"timeout_seconds_per_domain":timeout_seconds,"concurrency":concurrency,"batch_size":BATCH_SIZE,"page_limit":None,"depth_limit":None},"domains":domain_status,"backlinks":links}
+    links = []
+    domain_status = []
+    statuses = set()
+    for d, g in zip(domains, groups):
+        if isinstance(g, Exception):
+            g = {"status": "error", "pages_checked": 0, "elapsed_seconds": 0, "links_found": 0, "backlinks": []}
+        valid = [x for x in g.get("backlinks", []) if x.get("target_url")]
+        links.extend([{**x, "referring_domain": d} for x in valid])
+        st = str(g.get("status") or "error")
+        statuses.add(st)
+        domain_status.append({"referring_domain": d, "status": st, "pages_checked": g.get("pages_checked", 0), "elapsed_seconds": g.get("elapsed_seconds", 0), "links_found": len(valid)})
+    overall = "confirmed" if links else "timeout" if "timeout" in statuses else "error" if "error" in statuses else "blocked" if "blocked" in statuses else "page_limit"
+    return {"status": overall, "target_domain": target_domain, "layer1_referring_domains": len(domains), "domains_investigated": len(domains), "links_found": len(links), "limits": {"timeout_seconds_per_domain": timeout_seconds, "concurrency": concurrency, "batch_size": BATCH_SIZE, "page_limit": PAGE_LIMIT}, "domains": domain_status, "backlinks": links}

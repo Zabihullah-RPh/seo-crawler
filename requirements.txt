@@ -12,3 +12,8 @@ selectolax>=0.3.33
 requests>=2.32
 
 playwright>=1.40.0
+
+google-api-python-client>=2.179.0
+google-auth>=2.40.0
+google-auth-oauthlib>=1.2.2
+google-analytics-data>=0.18.19
