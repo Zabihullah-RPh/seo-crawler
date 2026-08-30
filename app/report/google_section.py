@@ -1,3 +1,3 @@
-from app.report.google_section_v2 import append_google_section
+from app.report.google_section_v3 import append_google_section
 
 __all__ = ["append_google_section"]
