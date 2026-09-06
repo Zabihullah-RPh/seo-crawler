@@ -2,8 +2,7 @@
 
 Layer 1 supplies referring domains from the local Common Crawl web graph.
 This module verifies exact page-level backlinks from Common Crawl CDXJ/WARC
-captures without crawling the referring websites live. Live verification can
-be used by the caller only when the Common Crawl index is unavailable.
+captures without crawling the referring websites live.
 """
 from __future__ import annotations
 
@@ -19,7 +18,7 @@ from bs4 import BeautifulSoup
 
 CC_INDEX_BASE = "https://index.commoncrawl.org"
 CC_DATA_BASE = "https://data.commoncrawl.org"
-USER_AGENT = "SEO-Crawler-Layer2-CommonCrawl/1.0 (+https://index.commoncrawl.org/)"
+USER_AGENT = "SEO-Crawler-Layer2-CommonCrawl/1.3 (+https://index.commoncrawl.org/)"
 DEFAULT_FALLBACK_CRAWLS = 2
 DEFAULT_PAGES_PER_DOMAIN = 25
 DEFAULT_WARC_CONCURRENCY = 8
@@ -34,13 +33,17 @@ def _host(url: str) -> str:
 def _canonical(url: str) -> str:
     try:
         parsed = urlparse(url)
+        scheme = parsed.scheme.lower() or "https"
         hostname = (parsed.hostname or "").lower()
         if not hostname:
             return url
         netloc = hostname
         if parsed.port:
             netloc += f":{parsed.port}"
-        return f"{(parsed.scheme or 'https').lower()}://{netloc}{parsed.path or '/'}" + (f"?{parsed.query}" if parsed.query else "")
+        result = f"{scheme}://{netloc}{parsed.path or '/'}"
+        if parsed.query:
+            result += f"?{parsed.query}"
+        return result
     except Exception:
         return url
 
@@ -83,14 +86,14 @@ def _extract_http_payload(blob: bytes) -> tuple[str, str] | None:
         second = remainder.find(marker)
         if second < 0:
             continue
-        headers = remainder[:second].decode("latin-1", errors="replace")
-        body = remainder[second + len(marker):].decode("utf-8", errors="replace")
+        http_headers = remainder[:second].decode("latin-1", errors="replace")
+        body = remainder[second + len(marker):]
         content_type = ""
-        for line in headers.splitlines():
+        for line in http_headers.splitlines():
             if line.lower().startswith("content-type:"):
                 content_type = line.split(":", 1)[1].strip().lower()
                 break
-        return content_type, body
+        return content_type, body.decode("utf-8", errors="replace")
     return None
 
 
@@ -98,32 +101,32 @@ async def _latest_crawls(client: httpx.AsyncClient, count: int) -> list[str]:
     response = await client.get(f"{CC_INDEX_BASE}/collinfo.json")
     response.raise_for_status()
     payload = response.json()
-    result = []
+    crawls = []
     for item in payload:
         crawl_id = str(item.get("id") or "").strip()
         if crawl_id:
-            result.append(crawl_id)
-    return result[:max(1, count)]
+            crawls.append(crawl_id)
+    return crawls[:max(1, count)]
 
 
 async def _query_form(client: httpx.AsyncClient, crawl: str, domain: str, limit: int, form: int, retries: int = 3) -> tuple[list[dict], str | None]:
-    if form == 0:
-        items = [("url", domain), ("matchType", "domain"), ("output", "json"), ("limit", str(limit))]
-    elif form == 1:
-        items = [("url", f"*.{domain}"), ("output", "json"), ("limit", str(limit))]
-    else:
-        items = [("url", f"{domain}/*"), ("matchType", "prefix"), ("output", "json"), ("limit", str(limit))]
-
+    query_forms = [
+        [("url", domain), ("matchType", "domain")],
+        [("url", f"*.{domain}")],
+        [("url", f"{domain}/*")],
+    ]
+    base_items = query_forms[form]
+    query_items = base_items + [("output", "json"), ("collapse", "urlkey"), ("limit", str(limit))]
     last_error = None
     for attempt in range(retries + 1):
         try:
-            response = await client.get(f"{CC_INDEX_BASE}/{crawl}-index", params=items)
+            response = await client.get(f"{CC_INDEX_BASE}/{crawl}-index", params=query_items)
             if response.status_code == 404:
                 return [], None
             if response.status_code in (429, 502, 503, 504):
                 last_error = f"HTTP {response.status_code}"
                 if attempt < retries:
-                    await asyncio.sleep(2.0 * (2 ** attempt) + random.uniform(0.2, 0.8))
+                    await asyncio.sleep(2.0 * (2 ** attempt) + random.uniform(0.25, 0.75))
                     continue
             response.raise_for_status()
             records = []
@@ -137,28 +140,32 @@ async def _query_form(client: httpx.AsyncClient, crawl: str, domain: str, limit:
                     continue
                 if item.get("url") and item.get("filename") and item.get("offset") is not None and item.get("length") is not None:
                     records.append(item)
-            return records[:limit], None
+            if records:
+                return records[:limit], None
+            last_error = None
+            break
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt < retries:
-                await asyncio.sleep(2.0 * (2 ** attempt) + random.uniform(0.2, 0.8))
+                await asyncio.sleep(2.0 * (2 ** attempt) + random.uniform(0.25, 0.75))
     return [], last_error
 
 
 async def _query_domain(client: httpx.AsyncClient, crawls: list[str], domain: str, limit: int, delay: float):
     errors = []
     tried = []
+    forms = (0, 1, 2)
     for crawl_index, crawl in enumerate(crawls):
         if crawl_index:
             await asyncio.sleep(delay)
         tried.append(crawl)
-        for form in (0, 1, 2):
+        for form in forms:
             records, error = await _query_form(client, crawl, domain, limit, form)
             if error:
-                errors.append(f"{crawl}:form={form}: {error}")
+                errors.append(f"{crawl}:form={form + 1}: {error}")
                 continue
             if records:
-                return records, crawl, f"form={form}", errors, tried
+                return records, crawl, f"form={form + 1}", errors, tried
     return [], None, None, errors, tried
 
 
@@ -186,7 +193,7 @@ async def _inspect_record(client: httpx.AsyncClient, record: dict, crawl: str, t
     if not parsed:
         return []
     content_type, html = parsed
-    looks_html = "html" in content_type or "<html" in html[:2000].lower() or "<a " in html[:2000].lower()
+    looks_html = "html" in content_type or "<html" in html[:1000].lower() or "<a " in html[:2000].lower()
     if not looks_html:
         return []
     source_url = _canonical(str(record.get("url") or ""))
@@ -219,7 +226,18 @@ async def _verify_domain(client: httpx.AsyncClient, crawls: list[str], source_do
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-    return {"referring_domain": source_domain, "status": "confirmed" if links else "not_found_in_sample", "crawls_tried": tried, "query_form": query_form, "records_returned": len(records), "pages_sampled": completed, "links_found": len(links), "elapsed_seconds": round(time.monotonic() - started, 2), "backlinks": links, "errors": errors}
+    return {
+        "referring_domain": source_domain,
+        "status": "confirmed" if links else "not_found_in_sample",
+        "crawls_tried": tried,
+        "query_form": query_form,
+        "records_returned": len(records),
+        "pages_sampled": completed,
+        "links_found": len(links),
+        "elapsed_seconds": round(time.monotonic() - started, 2),
+        "backlinks": links,
+        "errors": errors,
+    }
 
 
 async def investigate_layer2(url: str, layer1: dict, *, fallback_crawls: int = DEFAULT_FALLBACK_CRAWLS, pages_per_domain: int = DEFAULT_PAGES_PER_DOMAIN, concurrency: int = DEFAULT_WARC_CONCURRENCY, index_delay: float = DEFAULT_INDEX_DELAY) -> dict:
@@ -260,4 +278,16 @@ async def investigate_layer2(url: str, layer1: dict, *, fallback_crawls: int = D
     else:
         status = "error"
 
-    return {"status": status, "provider": "Common Crawl", "target_domain": target_domain, "layer1_referring_domains": len(domains), "domains_investigated": len(domains), "links_found": len(links), "fallback_available": status == "index_unavailable", "configuration": {"fallback_crawls": fallback_crawls, "pages_per_domain": pages_per_domain, "warc_concurrency": concurrency, "index_delay_seconds": index_delay}, "elapsed_seconds": round(time.monotonic() - started, 2), "domains": results, "backlinks": links}
+    return {
+        "status": status,
+        "provider": "Common Crawl",
+        "target_domain": target_domain,
+        "layer1_referring_domains": len(domains),
+        "domains_investigated": len(domains),
+        "links_found": len(links),
+        "fallback_available": status == "index_unavailable",
+        "configuration": {"fallback_crawls": fallback_crawls, "pages_per_domain": pages_per_domain, "warc_concurrency": concurrency, "index_delay_seconds": index_delay},
+        "elapsed_seconds": round(time.monotonic() - started, 2),
+        "domains": results,
+        "backlinks": links,
+    }
