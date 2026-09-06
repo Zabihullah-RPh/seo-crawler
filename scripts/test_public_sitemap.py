@@ -91,7 +91,8 @@ def discover(base: str) -> list[str]:
 
 
 def analyze(base: str) -> dict:
-    queue = deque(discover(base))
+    discovered = discover(base)
+    queue = deque(discovered)
     seen_maps = set()
     urls = []
     sitemap_stats = []
@@ -109,14 +110,13 @@ def analyze(base: str) -> dict:
             malformed.append({"url": sitemap_url, "error": str(exc)})
             continue
 
-        stat = {
+        sitemap_stats.append({
             "url": sitemap_url,
             "status": status,
             "content_type": content_type,
             "type": root_name,
             "entries": len(locs),
-        }
-        sitemap_stats.append(stat)
+        })
 
         if root_name in {"sitemapindex", "index"}:
             queue.extend(locs)
@@ -129,7 +129,7 @@ def analyze(base: str) -> dict:
     duplicates = len(urls) - len(set(urls))
 
     return {
-        "discovered_sitemaps": list(dict.fromkeys(discover(base))),
+        "discovered_sitemaps": discovered,
         "sitemaps_checked": len(sitemap_stats),
         "sitemaps": sitemap_stats,
         "urls_collected": len(urls),
