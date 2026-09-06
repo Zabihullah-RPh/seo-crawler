@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import re
+import webbrowser
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -54,14 +55,25 @@ async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, c
         max_depth=max_depth,
         concurrency=concurrency,
     )
-    await crawler.run()
+
+    # ProductionCrawler creates an intermediate report before Google enrichment.
+    # Do not let that intermediate report open in the browser. Only the final
+    # Google-enriched report below is opened.
+    original_browser_open = webbrowser.open
+    webbrowser.open = lambda *args, **kwargs: False
+    try:
+        await crawler.run()
+    finally:
+        webbrowser.open = original_browser_open
 
     crawl_report = RESULTS_DIR / f"crawl_{crawl_id}.json"
     if not crawl_report.exists():
         raise RuntimeError(f"Crawler completed but did not create {crawl_report}")
 
     data = json.loads(crawl_report.read_text(encoding="utf-8"))
+    print("[GOOGLE] Collecting Google API enrichment, including PageSpeed Insights...")
     google = enrich_google(crawler.start_url)
+    print(f"[GOOGLE] PageSpeed status: {_status(google.get('pagespeed', {}).get('status'))}")
 
     data["google_enrichment"] = google
     pagespeed = google.get("pagespeed", {}) or {}
@@ -86,9 +98,8 @@ async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, c
     output = RESULTS_DIR / f"audit_{_safe_name(crawler.start_url)}.json"
     output.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
-    # This is the single final report render. Do not run a second HTML rewrite
-    # afterward: audit_engine already renders PageSpeed and Google API results
-    # from the canonical google_enrichment dataset above.
+    # Single canonical final render. The renderer receives google_enrichment,
+    # including PageSpeed scores, and writes the final report directly.
     html_path = generate_report(data, output)
     print(f"Final HTML report: {html_path}")
     print(
@@ -99,6 +110,7 @@ async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, c
         f"Best Practices={pagespeed.get('best_practices', 'N/A')} | "
         f"SEO={pagespeed.get('seo', 'N/A')}"
     )
+    webbrowser.open(html_path.resolve().as_uri())
     return output
 
 
