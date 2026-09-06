@@ -12,7 +12,6 @@ from app.crawler.production import ProductionCrawler
 from app.integrations import backlink_layer2 as live_backlink_layer2
 from app.integrations.common_crawl_layer2 import investigate_layer2 as investigate_archive_layer2
 from app.integrations.google_enrichment import enrich as enrich_google
-from app.report.pipeline_report import write_pipeline_report
 from app.storage.db import create_crawl, initialize
 
 RESULTS_DIR = Path(__file__).resolve().parents[1] / "results"
@@ -28,12 +27,7 @@ def _status(value: object, default: str = "DATA_NOT_AVAILABLE") -> str:
 
 
 def _install_archive_layer2() -> None:
-    """Make the production crawler use Common Crawl WARC verification first.
-
-    production.py historically imports the live Layer 2 function locally during
-    report generation. Replacing that module function here keeps the public CLI
-    on the archive-first implementation without duplicating the crawler itself.
-    """
+    """Make the production crawler use Common Crawl WARC verification first."""
     original_live = live_backlink_layer2.investigate_layer2
 
     async def archive_first(url: str, layer1: dict, *args, **kwargs) -> dict:
@@ -69,7 +63,6 @@ async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, c
     data = json.loads(crawl_report.read_text(encoding="utf-8"))
     google = enrich_google(crawler.start_url)
 
-    # Keep Google results in the same canonical dataset consumed by the final renderer.
     data["google_enrichment"] = google
     pagespeed = google.get("pagespeed", {}) or {}
     data["pipeline"] = {
@@ -93,10 +86,10 @@ async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, c
     output = RESULTS_DIR / f"audit_{_safe_name(crawler.start_url)}.json"
     output.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
-    # generate_report is the single canonical renderer. It consumes google_enrichment directly.
+    # This is the single final report render. Do not run a second HTML rewrite
+    # afterward: audit_engine already renders PageSpeed and Google API results
+    # from the canonical google_enrichment dataset above.
     html_path = generate_report(data, output)
-    # Remove legacy duplicate blocks, then append the canonical Google/API block.
-    write_pipeline_report(html_path, html_path, google)
     print(f"Final HTML report: {html_path}")
     print(
         "PageSpeed Insights: "
