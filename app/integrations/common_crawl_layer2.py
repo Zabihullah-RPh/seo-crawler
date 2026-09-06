@@ -18,7 +18,7 @@ from bs4 import BeautifulSoup
 
 CC_INDEX_BASE = "https://index.commoncrawl.org"
 CC_DATA_BASE = "https://data.commoncrawl.org"
-USER_AGENT = "SEO-Crawler-Layer2-CommonCrawl/1.4 (+https://index.commoncrawl.org/)"
+USER_AGENT = "SEO-Crawler-Layer2-CommonCrawl/1.5 (+https://index.commoncrawl.org/)"
 DEFAULT_FALLBACK_CRAWLS = 2
 DEFAULT_PAGES_PER_DOMAIN = 25
 DEFAULT_WARC_CONCURRENCY = 8
@@ -128,28 +128,17 @@ async def _query_form(
         ("limit", str(limit)),
     ]
     last_error = None
-
     for attempt in range(retries + 1):
         try:
-            response = await client.get(
-                f"{CC_INDEX_BASE}/{crawl}-index",
-                params=params,
-            )
-
+            response = await client.get(f"{CC_INDEX_BASE}/{crawl}-index", params=params)
             if response.status_code == 404:
                 return [], None
-
             if response.status_code in (429, 502, 503, 504):
                 last_error = f"HTTP {response.status_code}"
                 if attempt < retries:
-                    await asyncio.sleep(
-                        2.0 * (2 ** attempt)
-                        + random.uniform(0.25, 0.75)
-                    )
+                    await asyncio.sleep(2.0 * (2 ** attempt) + random.uniform(0.25, 0.75))
                     continue
-
             response.raise_for_status()
-
             records = []
             for line in response.text.splitlines():
                 line = line.strip()
@@ -159,68 +148,14 @@ async def _query_form(
                     item = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if (
-                    item.get("url")
-                    and item.get("filename")
-                    and item.get("offset") is not None
-                    and item.get("length") is not None
-                ):
+                if item.get("url") and item.get("filename") and item.get("offset") is not None and item.get("length") is not None:
                     records.append(item)
-
-            if records:
-                return records[:limit], None
-
-            return [], None
-
+            return records[:limit], None
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt < retries:
-                await asyncio.sleep(
-                    2.0 * (2 ** attempt)
-                    + random.uniform(0.25, 0.75)
-                )
-
+                await asyncio.sleep(2.0 * (2 ** attempt) + random.uniform(0.25, 0.75))
     return [], last_error
-
-
-async def _query_domain(
-    client: httpx.AsyncClient,
-    crawls: list[str],
-    domain: str,
-    limit: int,
-    delay: float,
-):
-    errors = []
-    tried = []
-
-    for crawl_index, crawl in enumerate(crawls):
-        if crawl_index:
-            await asyncio.sleep(delay)
-        tried.append(crawl)
-
-        for form in (0, 1, 2):
-            records, error = await _query_form(
-                client,
-                crawl,
-                domain,
-                limit,
-                form,
-            )
-            if error:
-                errors.append(
-                    f"{crawl}:form={form + 1}: {error}"
-                )
-                continue
-            if records:
-                return (
-                    records,
-                    crawl,
-                    f"form={form + 1}",
-                    errors,
-                    tried,
-                )
-
-    return [], None, None, errors, tried
 
 
 async def _fetch_record(client: httpx.AsyncClient, record: dict) -> bytes | None:
@@ -246,36 +181,50 @@ async def _inspect_record(
         blob = await _fetch_record(client, record)
     if not blob:
         return []
-
     try:
         parsed = _extract_http_payload(blob)
     except (OSError, EOFError, gzip.BadGzipFile):
         return []
     if not parsed:
         return []
-
     content_type, html = parsed
-    looks_html = (
-        "html" in content_type
-        or "<html" in html[:1000].lower()
-        or "<a " in html[:2000].lower()
-    )
+    looks_html = "html" in content_type or "<html" in html[:1000].lower() or "<a " in html[:2000].lower()
     if not looks_html:
         return []
-
     source_url = _canonical(str(record.get("url") or ""))
     return [
-        {
-            **hit,
-            "crawl": crawl,
-            "capture_timestamp": record.get("timestamp"),
-        }
-        for hit in _extract_links(
-            html,
-            source_url,
-            target_domain,
-        )
+        {**hit, "crawl": crawl, "capture_timestamp": record.get("timestamp")}
+        for hit in _extract_links(html, source_url, target_domain)
     ]
+
+
+async def _verify_records(
+    client: httpx.AsyncClient,
+    records: list[dict],
+    crawl: str,
+    target_domain: str,
+    sem: asyncio.Semaphore,
+) -> tuple[list[dict], int]:
+    tasks = [asyncio.create_task(_inspect_record(client, record, crawl, target_domain, sem)) for record in records]
+    links = []
+    completed = 0
+    try:
+        for task in asyncio.as_completed(tasks):
+            try:
+                hits = await task
+            except Exception:
+                hits = []
+            completed += 1
+            if hits:
+                links.extend(hits)
+                break
+    finally:
+        pending = [task for task in tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    return links, completed
 
 
 async def _verify_domain(
@@ -287,87 +236,73 @@ async def _verify_domain(
     sem: asyncio.Semaphore,
     delay: float,
 ) -> dict:
+    """Verify each crawl in sequence; a capture without a hit is not a reason to stop.
+
+    The standalone Layer 2 test intentionally falls back from the newest crawl
+    to older captures when the newest captured pages do not contain the target.
+    Production must follow the same rule so known backlinks are not lost merely
+    because their confirming page exists only in an older Common Crawl capture.
+    """
     started = time.monotonic()
+    errors = []
+    tried = []
+    total_records = 0
+    total_pages = 0
+    last_form = None
 
-    records, crawl, query_form, errors, tried = await _query_domain(
-        client,
-        crawls,
-        source_domain,
-        pages_limit,
-        delay,
-    )
+    for crawl_index, crawl in enumerate(crawls):
+        if crawl_index:
+            await asyncio.sleep(delay)
+        tried.append(crawl)
 
-    if not records:
-        return {
-            "referring_domain": source_domain,
-            "status": "index_unavailable" if errors else "no_captures_found",
-            "crawls_tried": tried,
-            "query_form": query_form,
-            "records_returned": 0,
-            "pages_sampled": 0,
-            "links_found": 0,
-            "elapsed_seconds": round(
-                time.monotonic() - started,
-                2,
-            ),
-            "backlinks": [],
-            "errors": errors,
-        }
-
-    tasks = [
-        asyncio.create_task(
-            _inspect_record(
-                client,
-                record,
-                crawl,
-                target_domain,
-                sem,
-            )
-        )
-        for record in records
-    ]
-
-    links = []
-    completed = 0
-
-    try:
-        for task in asyncio.as_completed(tasks):
-            try:
-                hits = await task
-            except Exception:
-                hits = []
-
-            completed += 1
-
-            if hits:
-                links.extend(hits)
+        records = []
+        for form in (0, 1, 2):
+            found_records, error = await _query_form(client, crawl, source_domain, pages_limit, form)
+            if error:
+                errors.append(f"{crawl}:form={form + 1}: {error}")
+                continue
+            if found_records:
+                records = found_records
+                last_form = f"form={form + 1}"
                 break
-    finally:
-        pending = [
-            task for task in tasks
-            if not task.done()
-        ]
-        for task in pending:
-            task.cancel()
-        if pending:
-            await asyncio.gather(
-                *pending,
-                return_exceptions=True,
-            )
+
+        total_records += len(records)
+        if not records:
+            continue
+
+        hits, completed = await _verify_records(client, records, crawl, target_domain, sem)
+        total_pages += completed
+        if hits:
+            return {
+                "referring_domain": source_domain,
+                "status": "confirmed",
+                "crawls_tried": tried,
+                "query_form": last_form,
+                "records_returned": total_records,
+                "pages_sampled": total_pages,
+                "links_found": len(hits),
+                "elapsed_seconds": round(time.monotonic() - started, 2),
+                "backlinks": hits,
+                "errors": errors,
+            }
+
+    if total_records == 0 and errors:
+        status = "index_unavailable"
+    elif total_records == 0:
+        status = "no_captures_found"
+    else:
+        status = "not_found_in_sample"
 
     return {
         "referring_domain": source_domain,
-        "status": "confirmed" if links else "not_found_in_sample",
+        "status": status,
         "crawls_tried": tried,
-        "query_form": query_form,
-        "records_returned": len(records),
-        "pages_sampled": completed,
-        "links_found": len(links),
-        "elapsed_seconds": round(
-            time.monotonic() - started,
-            2,
-        ),
-        "backlinks": links,
+        "query_form": last_form,
+        "records_returned": total_records,
+        "pages_sampled": total_pages,
+        "links_found": 0,
+        "elapsed_seconds": round(time.monotonic() - started, 2),
+        "backlinks": [],
         "errors": errors,
     }
 
@@ -384,16 +319,9 @@ async def investigate_layer2(
     target_domain = _host(url)
     domains = []
     seen = set()
-
     for item in layer1.get("backlinks", []) or []:
-        domain = str(
-            item.get("referring_domain") or ""
-        ).strip().lower()
-        if (
-            domain
-            and domain != target_domain
-            and domain not in seen
-        ):
+        domain = str(item.get("referring_domain") or "").strip().lower()
+        if domain and domain != target_domain and domain not in seen:
             seen.add(domain)
             domains.append(domain)
 
@@ -408,31 +336,13 @@ async def investigate_layer2(
             "backlinks": [],
         }
 
-    fallback_crawls = max(
-        0,
-        min(int(fallback_crawls), 4),
-    )
-    pages_per_domain = max(
-        1,
-        min(int(pages_per_domain), 100),
-    )
-    concurrency = max(
-        1,
-        min(int(concurrency), 16),
-    )
-    index_delay = max(
-        1.0,
-        min(float(index_delay), 10.0),
-    )
+    fallback_crawls = max(0, min(int(fallback_crawls), 4))
+    pages_per_domain = max(1, min(int(pages_per_domain), 100))
+    concurrency = max(1, min(int(concurrency), 16))
+    index_delay = max(1.0, min(float(index_delay), 10.0))
 
-    timeout = httpx.Timeout(
-        30.0,
-        connect=12.0,
-    )
-    limits = httpx.Limits(
-        max_connections=max(8, concurrency * 2),
-        max_keepalive_connections=concurrency,
-    )
+    timeout = httpx.Timeout(30.0, connect=12.0)
+    limits = httpx.Limits(max_connections=max(8, concurrency * 2), max_keepalive_connections=concurrency)
     started = time.monotonic()
 
     async with httpx.AsyncClient(
@@ -441,58 +351,29 @@ async def investigate_layer2(
         follow_redirects=True,
         limits=limits,
     ) as client:
-        crawls = await _latest_crawls(
-            client,
-            fallback_crawls + 1,
-        )
+        crawls = await _latest_crawls(client, fallback_crawls + 1)
         sem = asyncio.Semaphore(concurrency)
         results = []
-
         for index, domain in enumerate(domains):
             if index:
                 await asyncio.sleep(index_delay)
-            results.append(
-                await _verify_domain(
-                    client,
-                    crawls,
-                    domain,
-                    target_domain,
-                    pages_per_domain,
-                    sem,
-                    index_delay,
-                )
-            )
+            results.append(await _verify_domain(client, crawls, domain, target_domain, pages_per_domain, sem, index_delay))
 
     links = []
     for result in results:
-        links.extend(
-            [
-                {
-                    **link,
-                    "referring_domain": result[
-                        "referring_domain"
-                    ],
-                    "layer": 2,
-                }
-                for link in result.get(
-                    "backlinks", []
-                )
-            ]
-        )
+        links.extend([
+            {
+                **link,
+                "referring_domain": result["referring_domain"],
+                "layer": 2,
+            }
+            for link in result.get("backlinks", [])
+        ])
 
-    statuses = {
-        str(result.get("status") or "error")
-        for result in results
-    }
-
+    statuses = {str(result.get("status") or "error") for result in results}
     if links:
         status = "confirmed"
-    elif statuses and statuses.issubset(
-        {
-            "no_captures_found",
-            "not_found_in_sample",
-        }
-    ):
+    elif statuses and statuses.issubset({"no_captures_found", "not_found_in_sample"}):
         status = "not_found_in_archive"
     elif "index_unavailable" in statuses:
         status = "index_unavailable"
@@ -513,10 +394,7 @@ async def investigate_layer2(
             "warc_concurrency": concurrency,
             "index_delay_seconds": index_delay,
         },
-        "elapsed_seconds": round(
-            time.monotonic() - started,
-            2,
-        ),
+        "elapsed_seconds": round(time.monotonic() - started, 2),
         "domains": results,
         "backlinks": links,
     }
