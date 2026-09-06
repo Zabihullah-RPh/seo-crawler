@@ -145,7 +145,7 @@ async def _query_form(client: httpx.AsyncClient, crawl: str, domain: str, limit:
     return [], last_error
 
 
-async def _query_domain(client: httpx.AsyncClient, crawls: list[str], domain: str, limit: int, delay: float) -> tuple[list[dict], str | None, str | None, list[str]]:
+async def _query_domain(client: httpx.AsyncClient, crawls: list[str], domain: str, limit: int, delay: float):
     errors = []
     tried = []
     for crawl_index, crawl in enumerate(crawls):
@@ -159,8 +159,6 @@ async def _query_domain(client: httpx.AsyncClient, crawls: list[str], domain: st
                 continue
             if records:
                 return records, crawl, f"form={form}", errors, tried
-    if errors:
-        return [], None, None, errors, tried
     return [], None, None, errors, tried
 
 
@@ -176,62 +174,52 @@ async def _fetch_record(client: httpx.AsyncClient, record: dict) -> bytes | None
     return response.content
 
 
+async def _inspect_record(client: httpx.AsyncClient, record: dict, crawl: str, target_domain: str, sem: asyncio.Semaphore) -> list[dict]:
+    async with sem:
+        blob = await _fetch_record(client, record)
+    if not blob:
+        return []
+    try:
+        parsed = _extract_http_payload(blob)
+    except (OSError, EOFError, gzip.BadGzipFile):
+        return []
+    if not parsed:
+        return []
+    content_type, html = parsed
+    looks_html = "html" in content_type or "<html" in html[:2000].lower() or "<a " in html[:2000].lower()
+    if not looks_html:
+        return []
+    source_url = _canonical(str(record.get("url") or ""))
+    return [{**hit, "crawl": crawl, "capture_timestamp": record.get("timestamp")} for hit in _extract_links(html, source_url, target_domain)]
+
+
 async def _verify_domain(client: httpx.AsyncClient, crawls: list[str], source_domain: str, target_domain: str, pages_limit: int, sem: asyncio.Semaphore, delay: float) -> dict:
     started = time.monotonic()
     records, crawl, query_form, errors, tried = await _query_domain(client, crawls, source_domain, pages_limit, delay)
     if not records:
-        return {
-            "referring_domain": source_domain,
-            "status": "index_unavailable" if errors else "no_captures_found",
-            "crawls_tried": tried,
-            "query_form": query_form,
-            "records_returned": 0,
-            "pages_sampled": 0,
-            "links_found": 0,
-            "elapsed_seconds": round(time.monotonic() - started, 2),
-            "backlinks": [],
-            "errors": errors,
-        }
+        return {"referring_domain": source_domain, "status": "index_unavailable" if errors else "no_captures_found", "crawls_tried": tried, "query_form": query_form, "records_returned": 0, "pages_sampled": 0, "links_found": 0, "elapsed_seconds": round(time.monotonic() - started, 2), "backlinks": [], "errors": errors}
 
-    async def inspect(record: dict) -> list[dict]:
-        async with sem:
-            blob = await _fetch_record(client, record)
-        if not blob:
-            return []
-        try:
-            parsed = _extract_http_payload(blob)
-        except (OSError, EOFError, gzip.BadGzipFile):
-            return []
-        if not parsed:
-            return []
-        content_type, html = parsed
-        looks_html = "html" in content_type or "<html" in html[:2000].lower() or "<a " in html[:2000].lower()
-        if not looks_html:
-            return []
-        source_url = _canonical(str(record.get("url") or ""))
-        return [{**hit, "crawl": crawl, "capture_timestamp": record.get("timestamp")} for hit in _extract_links(html, source_url, target_domain)]
-
-    results = await asyncio.gather(*(inspect(record) for record in records), return_exceptions=True)
+    tasks = [asyncio.create_task(_inspect_record(client, record, crawl, target_domain, sem)) for record in records]
     links = []
-    for item in results:
-        if isinstance(item, Exception):
-            continue
-        links.extend(item)
-        if links:
-            break
+    completed = 0
+    try:
+        for task in asyncio.as_completed(tasks):
+            try:
+                hits = await task
+            except Exception:
+                hits = []
+            completed += 1
+            if hits:
+                links.extend(hits)
+                break
+    finally:
+        pending = [task for task in tasks if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
-    return {
-        "referring_domain": source_domain,
-        "status": "confirmed" if links else "not_found_in_sample",
-        "crawls_tried": tried,
-        "query_form": query_form,
-        "records_returned": len(records),
-        "pages_sampled": len(results),
-        "links_found": len(links),
-        "elapsed_seconds": round(time.monotonic() - started, 2),
-        "backlinks": links,
-        "errors": errors,
-    }
+    return {"referring_domain": source_domain, "status": "confirmed" if links else "not_found_in_sample", "crawls_tried": tried, "query_form": query_form, "records_returned": len(records), "pages_sampled": completed, "links_found": len(links), "elapsed_seconds": round(time.monotonic() - started, 2), "backlinks": links, "errors": errors}
 
 
 async def investigate_layer2(url: str, layer1: dict, *, fallback_crawls: int = DEFAULT_FALLBACK_CRAWLS, pages_per_domain: int = DEFAULT_PAGES_PER_DOMAIN, concurrency: int = DEFAULT_WARC_CONCURRENCY, index_delay: float = DEFAULT_INDEX_DELAY) -> dict:
@@ -272,21 +260,4 @@ async def investigate_layer2(url: str, layer1: dict, *, fallback_crawls: int = D
     else:
         status = "error"
 
-    return {
-        "status": status,
-        "provider": "Common Crawl",
-        "target_domain": target_domain,
-        "layer1_referring_domains": len(domains),
-        "domains_investigated": len(domains),
-        "links_found": len(links),
-        "fallback_available": status == "index_unavailable",
-        "configuration": {
-            "fallback_crawls": fallback_crawls,
-            "pages_per_domain": pages_per_domain,
-            "warc_concurrency": concurrency,
-            "index_delay_seconds": index_delay,
-        },
-        "elapsed_seconds": round(time.monotonic() - started, 2),
-        "domains": results,
-        "backlinks": links,
-    }
+    return {"status": status, "provider": "Common Crawl", "target_domain": target_domain, "layer1_referring_domains": len(domains), "domains_investigated": len(domains), "links_found": len(links), "fallback_available": status == "index_unavailable", "configuration": {"fallback_crawls": fallback_crawls, "pages_per_domain": pages_per_domain, "warc_concurrency": concurrency, "index_delay_seconds": index_delay}, "elapsed_seconds": round(time.monotonic() - started, 2), "domains": results, "backlinks": links}
