@@ -1,16 +1,14 @@
-"""Layer 2 live backlink verification with persistent domain-result caching.
+"""Layer 2 live backlink verification.
 
-Layer 1 Common Crawl remains the broad discovery source. Layer 2 verifies candidate
-referring domains with bounded time/page limits. Results are cached per target and
-referring domain so already-checked domains are not re-crawled on every audit.
+Layer 1 Common Crawl remains the broad discovery source. Layer 2 only verifies
+candidate referring domains with bounded time/page limits so a slow referring
+site cannot block the entire SEO audit.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import time
 from collections import deque
-from pathlib import Path
 from urllib.parse import urldefrag, urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -22,7 +20,6 @@ DEFAULT_TIMEOUT_SECONDS = 20
 DEFAULT_CONCURRENCY = 16
 BATCH_SIZE = 16
 PAGE_LIMIT = 30
-CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 def _host(url: str) -> str:
@@ -46,54 +43,6 @@ def _canonical(url: str) -> str:
         return normalize_url(url)
     except Exception:
         return url
-
-
-def _default_cache_path() -> Path:
-    root = Path(__file__).resolve().parents[2]
-    path = root / "results" / "layer2_cache.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _load_cache(path: Path) -> dict:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
-    except (OSError, ValueError, TypeError):
-        return {}
-
-
-def _save_cache(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-    tmp.replace(path)
-
-
-def _cache_key(target_domain: str, referring_domain: str) -> str:
-    return f"{target_domain}|{referring_domain}"
-
-
-def _get_cached(cache: dict, target_domain: str, referring_domain: str, ttl_seconds: float, refresh: bool) -> dict | None:
-    if refresh:
-        return None
-    item = cache.get(_cache_key(target_domain, referring_domain))
-    if not isinstance(item, dict):
-        return None
-    saved_at = float(item.get("cached_at", 0) or 0)
-    if saved_at <= 0 or time.time() - saved_at > ttl_seconds:
-        return None
-    result = item.get("result")
-    if not isinstance(result, dict):
-        return None
-    return {**result, "cache_hit": True}
-
-
-def _put_cached(cache: dict, target_domain: str, referring_domain: str, result: dict) -> None:
-    cache[_cache_key(target_domain, referring_domain)] = {
-        "cached_at": time.time(),
-        "result": result,
-    }
 
 
 def _extract(html: str, source_url: str, source_domain: str, target_domain: str):
@@ -251,16 +200,7 @@ async def investigate_referring_domain(http: HTTPClient, source_domain: str, tar
     return {"status": "timeout" if time.monotonic() >= deadline else "page_limit", "referring_domain": source_domain, "target_domain": target_domain, "pages_checked": attempted, "elapsed_seconds": round(elapsed, 2), "links_found": 0, "backlinks": []}
 
 
-async def investigate_layer2(
-    url: str,
-    layer1: dict,
-    *,
-    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
-    concurrency: int = DEFAULT_CONCURRENCY,
-    cache_path: str | Path | None = None,
-    refresh: bool = False,
-    cache_ttl_seconds: float = CACHE_TTL_SECONDS,
-) -> dict:
+async def investigate_layer2(url: str, layer1: dict, *, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS, concurrency: int = DEFAULT_CONCURRENCY) -> dict:
     target_domain = _host(url)
     domains = []
     seen = set()
@@ -272,71 +212,21 @@ async def investigate_layer2(
     if not domains:
         return {"status": "no_referring_domains", "target_domain": target_domain, "layer1_referring_domains": 0, "domains_investigated": 0, "links_found": 0, "backlinks": []}
 
-    cache_file = Path(cache_path) if cache_path else _default_cache_path()
-    cache = _load_cache(cache_file)
     http = HTTPClient(concurrency=max(1, int(concurrency)))
-    groups = []
-    cache_dirty = False
-    uncached_domains = []
     try:
-        for domain in domains:
-            cached = _get_cached(cache, target_domain, domain, cache_ttl_seconds, refresh)
-            if cached is not None:
-                groups.append(cached)
-            else:
-                uncached_domains.append(domain)
-
-        if uncached_domains:
-            groups_by_domain = {}
-            sem = asyncio.Semaphore(max(1, int(concurrency)))
-
-            async def one(domain: str):
-                async with sem:
-                    return await investigate_referring_domain(http, domain, target_domain, timeout_seconds=timeout_seconds)
-
-            fresh = await asyncio.gather(*(one(d) for d in uncached_domains), return_exceptions=True)
-            for domain, group in zip(uncached_domains, fresh):
-                if isinstance(group, Exception):
-                    group = {"status": "error", "referring_domain": domain, "target_domain": target_domain, "pages_checked": 0, "elapsed_seconds": 0, "links_found": 0, "backlinks": []}
-                groups_by_domain[domain] = group
-                if str(group.get("status")) != "error":
-                    _put_cached(cache, target_domain, domain, group)
-                    cache_dirty = True
-            groups.extend(groups_by_domain[d] for d in uncached_domains)
+        groups = await asyncio.gather(*(investigate_referring_domain(http, d, target_domain, timeout_seconds=timeout_seconds) for d in domains), return_exceptions=True)
     finally:
         await http.close()
-
-    if cache_dirty:
-        _save_cache(cache_file, cache)
-
-    ordered = {str(g.get("referring_domain")): g for g in groups}
-    groups = [ordered[d] for d in domains if d in ordered]
     links = []
-    for group in groups:
-        valid = [x for x in group.get("backlinks", []) if x.get("target_url")]
-        links.extend([{**x, "referring_domain": group.get("referring_domain")} for x in valid])
-
-    statuses = {str(g.get("status") or "error") for g in groups}
-    if links:
-        overall = "confirmed"
-    elif all(bool(g.get("cache_hit")) for g in groups) and groups:
-        overall = "cached_no_links"
-    elif "error" in statuses:
-        overall = "error"
-    elif "timeout" in statuses:
-        overall = "timeout"
-    else:
-        overall = "not_found"
-
-    return {
-        "status": overall,
-        "target_domain": target_domain,
-        "layer1_referring_domains": len(domains),
-        "domains_investigated": len(uncached_domains),
-        "domains_reused": len(domains) - len(uncached_domains),
-        "links_found": len(links),
-        "timeout_seconds": timeout_seconds,
-        "cache": {"path": str(cache_file), "ttl_seconds": cache_ttl_seconds, "refresh": refresh},
-        "domains": groups,
-        "backlinks": links,
-    }
+    domain_status = []
+    statuses = set()
+    for d, g in zip(domains, groups):
+        if isinstance(g, Exception):
+            g = {"status": "error", "pages_checked": 0, "elapsed_seconds": 0, "links_found": 0, "backlinks": []}
+        valid = [x for x in g.get("backlinks", []) if x.get("target_url")]
+        links.extend([{**x, "referring_domain": d} for x in valid])
+        st = str(g.get("status") or "error")
+        statuses.add(st)
+        domain_status.append({"referring_domain": d, "status": st, "pages_checked": g.get("pages_checked", 0), "elapsed_seconds": g.get("elapsed_seconds", 0), "links_found": len(valid)})
+    overall = "confirmed" if links else "timeout" if "timeout" in statuses else "error" if "error" in statuses else "blocked" if "blocked" in statuses else "page_limit"
+    return {"status": overall, "target_domain": target_domain, "layer1_referring_domains": len(domains), "domains_investigated": len(domains), "links_found": len(links), "limits": {"timeout_seconds_per_domain": timeout_seconds, "concurrency": concurrency, "batch_size": BATCH_SIZE, "page_limit": PAGE_LIMIT}, "domains": domain_status, "backlinks": links}
