@@ -10,8 +10,6 @@ from urllib.parse import urlparse
 
 from app.audit_engine import generate_report
 from app.crawler.production import ProductionCrawler
-from app.integrations import backlink_layer2 as live_backlink_layer2
-from app.integrations.common_crawl_layer2 import investigate_layer2 as investigate_archive_layer2
 from app.integrations.google_enrichment import enrich as enrich_google
 from app.storage.db import create_crawl, initialize
 
@@ -27,26 +25,8 @@ def _status(value: object, default: str = "DATA_NOT_AVAILABLE") -> str:
     return value if isinstance(value, str) else default
 
 
-def _install_archive_layer2() -> None:
-    """Make the production crawler use Common Crawl WARC verification first."""
-    original_live = live_backlink_layer2.investigate_layer2
-
-    async def archive_first(url: str, layer1: dict, *args, **kwargs) -> dict:
-        result = await investigate_archive_layer2(url, layer1)
-        if result.get("status") == "index_unavailable":
-            print("[BACKLINKS] Common Crawl archive index unavailable; falling back to live Layer 2")
-            fallback = await original_live(url, layer1, *args, **kwargs)
-            fallback["found_via"] = "live_crawl_fallback"
-            return fallback
-        result["found_via"] = "common_crawl_warc"
-        return result
-
-    live_backlink_layer2.investigate_layer2 = archive_first
-
-
 async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, concurrency: int = 20) -> Path:
     await initialize()
-    _install_archive_layer2()
     crawl_id = await create_crawl(url, max_pages, max_depth, concurrency)
     crawler = ProductionCrawler(
         crawl_id=crawl_id,
@@ -71,6 +51,15 @@ async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, c
         raise RuntimeError(f"Crawler completed but did not create {crawl_report}")
 
     data = json.loads(crawl_report.read_text(encoding="utf-8"))
+    backlinks = data.get("backlinks", {}) or {}
+    layer2 = backlinks.get("layer2", {}) or {}
+    print(
+        "[BACKLINKS] Layer 2 result: "
+        f"status={layer2.get('status', 'unknown')} | "
+        f"links={int(layer2.get('links_found', 0) or 0)} | "
+        f"found_via={layer2.get('found_via', 'common_crawl_warc')}"
+    )
+
     print("[GOOGLE] Collecting Google API enrichment, including PageSpeed Insights...")
     google = enrich_google(crawler.start_url)
     print(f"[GOOGLE] PageSpeed status: {_status(google.get('pagespeed', {}).get('status'))}")
@@ -98,8 +87,8 @@ async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, c
     output = RESULTS_DIR / f"audit_{_safe_name(crawler.start_url)}.json"
     output.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
-    # Single canonical final render. The renderer receives google_enrichment,
-    # including PageSpeed scores, and writes the final report directly.
+    # Single canonical final render. The renderer receives the complete crawl
+    # payload, including Layer 1 and Layer 2 backlink results and PageSpeed.
     html_path = generate_report(data, output)
     print(f"Final HTML report: {html_path}")
     print(
