@@ -1,26 +1,9 @@
 """Experimental Common Crawl archive-based Layer 2 backlink test.
 
-This test does NOT modify the production Layer 2 implementation.
-It uses the public Common Crawl CDXJ index to find captured pages on
-known referring domains, then range-fetches WARC records and checks for
-exact links to the target domain.
-
-The index lookup deliberately starts broad: capture discovery is separated
-from HTTP-status/mime filtering so a restrictive CDX filter cannot turn an
-available domain into a false "no captures" result. Common Crawl asks clients
-to avoid concurrent CDX requests, so domain lookups are sequential with a
-small delay and retries. Older crawls are used when a newer crawl has no
-usable records.
-
-Usage:
-    python -m scripts.test_layer2_commoncrawl https://avw.au
-
-Optional:
-    --domain example.com --domain example.org
-    --crawl CC-MAIN-2026-34
-    --fallback-crawls 2
-    --pages 25
-    --concurrency 8
+Test-only: this does not modify the production Layer 2 implementation.
+It uses the public Common Crawl CDXJ index to find captured pages on known
+referring domains, then range-fetches WARC records and checks exact links to
+the target domain.
 """
 from __future__ import annotations
 
@@ -44,7 +27,7 @@ DEFAULT_DOMAINS = [
 ]
 CC_INDEX_BASE = "https://index.commoncrawl.org"
 CC_DATA_BASE = "https://data.commoncrawl.org"
-USER_AGENT = "SEO-Crawler-Layer2-CommonCrawl-Test/1.2 (+https://index.commoncrawl.org/)"
+USER_AGENT = "SEO-Crawler-Layer2-CommonCrawl-Test/1.3 (+https://index.commoncrawl.org/)"
 
 
 def host(url: str) -> str:
@@ -101,18 +84,20 @@ def extract_http_payload(warc_gzip: bytes) -> tuple[str, str] | None:
     raw = gzip.decompress(warc_gzip)
     for marker in (b"\r\n\r\n", b"\n\n"):
         first = raw.find(marker)
-        if first >= 0:
-            remainder = raw[first + len(marker):]
-            second = remainder.find(marker)
-            if second >= 0:
-                http_headers = remainder[:second].decode("latin-1", errors="replace")
-                body = remainder[second + len(marker):]
-                content_type = ""
-                for line in http_headers.splitlines():
-                    if line.lower().startswith("content-type:"):
-                        content_type = line.split(":", 1)[1].strip().lower()
-                        break
-                return content_type, body.decode("utf-8", errors="replace")
+        if first < 0:
+            continue
+        remainder = raw[first + len(marker):]
+        second = remainder.find(marker)
+        if second < 0:
+            continue
+        http_headers = remainder[:second].decode("latin-1", errors="replace")
+        body = remainder[second + len(marker):]
+        content_type = ""
+        for line in http_headers.splitlines():
+            if line.lower().startswith("content-type:"):
+                content_type = line.split(":", 1)[1].strip().lower()
+                break
+        return content_type, body.decode("utf-8", errors="replace")
     return None
 
 
@@ -128,55 +113,59 @@ async def latest_crawls(client: httpx.AsyncClient, count: int) -> list[str]:
     return crawls[: max(1, count)]
 
 
-async def query_domain(
-    client: httpx.AsyncClient,
-    crawl: str,
-    domain: str,
-    limit: int,
-    retries: int = 3,
-) -> tuple[list[dict], str | None]:
-    """Broadly discover captures; perform filtering after WARC fetch.
+async def query_domain(client: httpx.AsyncClient, crawl: str, domain: str, limit: int, retries: int = 3) -> tuple[list[dict], str | None, str]:
+    """Query using documented domain/wildcard forms rather than domain/*+prefix.
 
-    We intentionally do not send status/mime filters here. This prevents a
-    server-side mime classification difference from hiding captures that can
-    still contain useful HTML for backlink verification.
+    Common Crawl treats `matchType=domain` as the domain-wide lookup and also
+    supports wildcard URL patterns. We try domain-wide first, then wildcard,
+    because the former is explicit and the latter is useful across index-server
+    versions. No status/mime filters are applied at query time.
     """
-    query_items = [
-        ("url", f"{domain}/*"),
-        ("matchType", "prefix"),
-        ("output", "json"),
-        ("collapse", "urlkey"),
-        ("limit", str(limit)),
+    query_forms = [
+        [("url", domain), ("matchType", "domain")],
+        [("url", f"*.{domain}")],
+        [("url", f"{domain}/*")],
     ]
     last_error = None
-    for attempt in range(retries + 1):
-        try:
-            response = await client.get(f"{CC_INDEX_BASE}/{crawl}-index", params=query_items)
-            if response.status_code == 404:
-                return [], None
-            if response.status_code in (429, 502, 503, 504):
-                last_error = f"HTTP {response.status_code}"
+    for form_index, base_items in enumerate(query_forms):
+        query_items = base_items + [
+            ("output", "json"),
+            ("collapse", "urlkey"),
+            ("limit", str(limit)),
+        ]
+        for attempt in range(retries + 1):
+            try:
+                response = await client.get(f"{CC_INDEX_BASE}/{crawl}-index", params=query_items)
+                if response.status_code == 404:
+                    return [], None, f"form={form_index + 1} http=404"
+                if response.status_code in (429, 502, 503, 504):
+                    last_error = f"HTTP {response.status_code}"
+                    if attempt < retries:
+                        await asyncio.sleep(2.0 * (2 ** attempt) + random.uniform(0.25, 0.75))
+                        continue
+                response.raise_for_status()
+                records = []
+                for line in response.text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if item.get("url") and item.get("filename") and item.get("offset") is not None and item.get("length") is not None:
+                        records.append(item)
+                if records:
+                    return records[:limit], None, f"form={form_index + 1}"
+                # An empty result from the first form is not a hard failure; try
+                # the alternative wildcard/domain forms before concluding no capture.
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
                 if attempt < retries:
                     await asyncio.sleep(2.0 * (2 ** attempt) + random.uniform(0.25, 0.75))
-                    continue
-            response.raise_for_status()
-            records = []
-            for line in response.text.splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    item = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if item.get("url") and item.get("filename") and item.get("offset") is not None and item.get("length") is not None:
-                    records.append(item)
-            return records[:limit], None
-        except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
-            if attempt < retries:
-                await asyncio.sleep(2.0 * (2 ** attempt) + random.uniform(0.25, 0.75))
-    return [], last_error
+    return [], last_error, "all_forms_failed"
 
 
 async def fetch_record(client: httpx.AsyncClient, record: dict) -> bytes | None:
@@ -209,16 +198,15 @@ async def verify_domain(
         if crawl_index:
             await asyncio.sleep(index_delay)
         attempted_crawls.append(crawl)
-        records, error = await query_domain(client, crawl, source_domain, page_limit)
+        records, error, query_form = await query_domain(client, crawl, source_domain, page_limit)
         if error:
-            all_errors.append(f"{crawl}: {error}")
+            all_errors.append(f"{crawl} ({query_form}): {error}")
             continue
         total_records += len(records)
         if not records:
             continue
 
         found = []
-
         async def one(record: dict):
             async with sem:
                 blob = await fetch_record(client, record)
@@ -231,8 +219,6 @@ async def verify_domain(
             if not parsed:
                 return []
             content_type, html = parsed
-            # Some Common Crawl records have imperfect or missing MIME metadata;
-            # try parsing the payload anyway when it looks like HTML.
             looks_html = "html" in content_type or "<html" in html[:1000].lower() or "<a " in html[:2000].lower()
             if not looks_html:
                 return []
@@ -253,6 +239,7 @@ async def verify_domain(
                     "domain": source_domain,
                     "status": "confirmed",
                     "crawl": crawl,
+                    "query_form": query_form,
                     "crawls_tried": attempted_crawls,
                     "records_returned": total_records,
                     "pages_sampled": total_pages,
@@ -304,7 +291,7 @@ async def run(args) -> int:
         print(f"Concurrency:       {args.concurrency}")
         print(f"Index delay:       {args.index_delay}s")
         print("\nLayer 1 is not re-run; the known referring domains are used directly.")
-        print("CDX lookup is broad; status/MIME decisions are made after WARC retrieval.")
+        print("CDX uses domain + wildcard fallback forms; WARC content is checked for exact links.")
 
         sem = asyncio.Semaphore(max(1, args.concurrency))
         results = []
@@ -317,10 +304,11 @@ async def run(args) -> int:
     confirmed = []
     for item in results:
         extra = f" | errors={len(item.get('errors', []))}" if item.get("errors") else ""
+        qform = f" | query={item.get('query_form')}" if item.get("query_form") else ""
         print(
             f"  - {item['domain']}: {item['status']} | records={item.get('records_returned', 0)} | "
             f"pages={item.get('pages_sampled', 0)} | links={item.get('links_found', 0)} | "
-            f"crawls={','.join(item.get('crawls_tried', []))} | time={item.get('elapsed', 0)}s{extra}"
+            f"crawls={','.join(item.get('crawls_tried', []))} | time={item.get('elapsed', 0)}s{qform}{extra}"
         )
         confirmed.extend(item.get("backlinks", []))
         for error in item.get("errors", []) or []:
