@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 
 from app.audit_engine import generate_report
 from app.crawler.production import ProductionCrawler
+from app.integrations import backlink_layer2 as live_backlink_layer2
+from app.integrations.common_crawl_layer2 import investigate_layer2 as investigate_archive_layer2
 from app.integrations.google_enrichment import enrich as enrich_google
 from app.report.pipeline_report import write_pipeline_report
 from app.storage.db import create_crawl, initialize
@@ -25,8 +27,31 @@ def _status(value: object, default: str = "DATA_NOT_AVAILABLE") -> str:
     return value if isinstance(value, str) else default
 
 
+def _install_archive_layer2() -> None:
+    """Make the production crawler use Common Crawl WARC verification first.
+
+    production.py historically imports the live Layer 2 function locally during
+    report generation. Replacing that module function here keeps the public CLI
+    on the archive-first implementation without duplicating the crawler itself.
+    """
+    original_live = live_backlink_layer2.investigate_layer2
+
+    async def archive_first(url: str, layer1: dict, *args, **kwargs) -> dict:
+        result = await investigate_archive_layer2(url, layer1)
+        if result.get("status") == "index_unavailable":
+            print("[BACKLINKS] Common Crawl archive index unavailable; falling back to live Layer 2")
+            fallback = await original_live(url, layer1, *args, **kwargs)
+            fallback["found_via"] = "live_crawl_fallback"
+            return fallback
+        result["found_via"] = "common_crawl_warc"
+        return result
+
+    live_backlink_layer2.investigate_layer2 = archive_first
+
+
 async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, concurrency: int = 20) -> Path:
     await initialize()
+    _install_archive_layer2()
     crawl_id = await create_crawl(url, max_pages, max_depth, concurrency)
     crawler = ProductionCrawler(
         crawl_id=crawl_id,
@@ -46,13 +71,14 @@ async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, c
 
     # Keep Google results in the same canonical dataset consumed by the final renderer.
     data["google_enrichment"] = google
+    pagespeed = google.get("pagespeed", {}) or {}
     data["pipeline"] = {
         "status": "PASS",
         "layers": {
             "site_crawl": "PASS",
             "public_external": {
                 "status": "PASS",
-                "pagespeed": _status(google.get("pagespeed", {}).get("status")),
+                "pagespeed": _status(pagespeed.get("status")),
             },
             "private_google_enrichment": {
                 name: _status(
@@ -67,11 +93,19 @@ async def run_pipeline(url: str, max_pages: int = 100000, max_depth: int = 50, c
     output = RESULTS_DIR / f"audit_{_safe_name(crawler.start_url)}.json"
     output.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
-    # generate_report is the single canonical renderer. It now consumes google_enrichment directly.
+    # generate_report is the single canonical renderer. It consumes google_enrichment directly.
     html_path = generate_report(data, output)
-    # Normalize the final file in-place to remove any legacy duplicate report blocks.
+    # Remove legacy duplicate blocks, then append the canonical Google/API block.
     write_pipeline_report(html_path, html_path, google)
     print(f"Final HTML report: {html_path}")
+    print(
+        "PageSpeed Insights: "
+        f"{_status(pagespeed.get('status'))} | "
+        f"Performance={pagespeed.get('performance', 'N/A')} | "
+        f"Accessibility={pagespeed.get('accessibility', 'N/A')} | "
+        f"Best Practices={pagespeed.get('best_practices', 'N/A')} | "
+        f"SEO={pagespeed.get('seo', 'N/A')}"
+    )
     return output
 
 
@@ -93,7 +127,15 @@ def main() -> int:
     print(f"Pages:  {len(data.get('pages', []))}")
     print(f"Links:  {len(data.get('links', []))}")
     print(f"Images: {len(data.get('images', []))}")
-    print(f"PageSpeed: {_status(data.get('google_enrichment', {}).get('pagespeed', {}).get('status'))}")
+    pagespeed = data.get("google_enrichment", {}).get("pagespeed", {}) or {}
+    print(
+        "PageSpeed: "
+        f"{_status(pagespeed.get('status'))} | "
+        f"Performance={pagespeed.get('performance', 'N/A')} | "
+        f"Accessibility={pagespeed.get('accessibility', 'N/A')} | "
+        f"Best Practices={pagespeed.get('best_practices', 'N/A')} | "
+        f"SEO={pagespeed.get('seo', 'N/A')}"
+    )
     private = data.get("pipeline", {}).get("layers", {}).get("private_google_enrichment", {})
     for name in ("search_console", "sitemaps", "url_inspection", "search_analytics", "ga4"):
         print(f"Google {name}: {private.get(name, 'DATA_NOT_AVAILABLE')}")
