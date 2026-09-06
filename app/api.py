@@ -13,11 +13,14 @@ import aiosqlite
 
 from app.storage.db import initialize, create_crawl, DATABASE_PATH
 from app.crawler.production import ProductionCrawler
+from app.integrations.google_routes import router as google_router
 
 app = FastAPI(
     title="SEO Crawler",
     version="4.0"
 )
+
+app.include_router(google_router)
 
 class CrawlRequest(BaseModel):
     url: str

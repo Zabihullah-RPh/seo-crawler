@@ -22,6 +22,7 @@ exports/
 .env
 .env.*
 !.env.example
+credentials/
 
 # OS/editor files
 .DS_Store
