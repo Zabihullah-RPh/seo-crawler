@@ -117,12 +117,12 @@ async def _query_form(
     form: int,
     retries: int = 3,
 ) -> tuple[list[dict], str | None]:
-    query_forms = [
+    forms = [
         [("url", domain), ("matchType", "domain")],
         [("url", f"*.{domain}")],
         [("url", f"{domain}/*"), ("matchType", "prefix")],
     ]
-    query_items = query_forms[form] + [
+    params = forms[form] + [
         ("output", "json"),
         ("collapse", "urlkey"),
         ("limit", str(limit)),
@@ -133,7 +133,7 @@ async def _query_form(
         try:
             response = await client.get(
                 f"{CC_INDEX_BASE}/{crawl}-index",
-                params=query_items,
+                params=params,
             )
 
             if response.status_code == 404:
@@ -168,7 +168,7 @@ async def _query_form(
                     records.append(item)
 
             if records:
-                return records[:limit], f"form={form + 1}"
+                return records[:limit], None
 
             return [], None
 
@@ -192,44 +192,43 @@ async def _query_domain(
 ):
     errors = []
     tried = []
-    forms = (0, 1, 2)
 
     for crawl_index, crawl in enumerate(crawls):
         if crawl_index:
             await asyncio.sleep(delay)
         tried.append(crawl)
 
-        for form in forms:
-            records, query_form = await _query_form(
+        for form in (0, 1, 2):
+            records, error = await _query_form(
                 client,
                 crawl,
                 domain,
                 limit,
                 form,
             )
-            if query_form is None and not records:
-                # _query_form only returns an error string as the second item
-                # when the index request itself failed.
+            if error:
+                errors.append(
+                    f"{crawl}:form={form + 1}: {error}"
+                )
                 continue
-            if isinstance(query_form, str) and query_form.startswith("form="):
-                return records, crawl, query_form, errors, tried
-
-        # Continue to older crawls if this crawl returned no captures.
+            if records:
+                return (
+                    records,
+                    crawl,
+                    f"form={form + 1}",
+                    errors,
+                    tried,
+                )
 
     return [], None, None, errors, tried
 
 
-async def _fetch_record(
-    client: httpx.AsyncClient,
-    record: dict,
-) -> bytes | None:
+async def _fetch_record(client: httpx.AsyncClient, record: dict) -> bytes | None:
     offset = int(record["offset"])
     length = int(record["length"])
     response = await client.get(
         f"{CC_DATA_BASE}/{record['filename']}",
-        headers={
-            "Range": f"bytes={offset}-{offset + length - 1}"
-        },
+        headers={"Range": f"bytes={offset}-{offset + length - 1}"},
     )
     if response.status_code not in (200, 206):
         return None
@@ -252,7 +251,6 @@ async def _inspect_record(
         parsed = _extract_http_payload(blob)
     except (OSError, EOFError, gzip.BadGzipFile):
         return []
-
     if not parsed:
         return []
 
@@ -302,13 +300,16 @@ async def _verify_domain(
     if not records:
         return {
             "referring_domain": source_domain,
-            "status": "no_captures_found" if not errors else "index_unavailable",
+            "status": "index_unavailable" if errors else "no_captures_found",
             "crawls_tried": tried,
             "query_form": query_form,
             "records_returned": 0,
             "pages_sampled": 0,
             "links_found": 0,
-            "elapsed_seconds": round(time.monotonic() - started, 2),
+            "elapsed_seconds": round(
+                time.monotonic() - started,
+                2,
+            ),
             "backlinks": [],
             "errors": errors,
         }
@@ -342,7 +343,10 @@ async def _verify_domain(
                 links.extend(hits)
                 break
     finally:
-        pending = [task for task in tasks if not task.done()]
+        pending = [
+            task for task in tasks
+            if not task.done()
+        ]
         for task in pending:
             task.cancel()
         if pending:
@@ -359,7 +363,10 @@ async def _verify_domain(
         "records_returned": len(records),
         "pages_sampled": completed,
         "links_found": len(links),
-        "elapsed_seconds": round(time.monotonic() - started, 2),
+        "elapsed_seconds": round(
+            time.monotonic() - started,
+            2,
+        ),
         "backlinks": links,
         "errors": errors,
     }
@@ -375,7 +382,6 @@ async def investigate_layer2(
     index_delay: float = DEFAULT_INDEX_DELAY,
 ) -> dict:
     target_domain = _host(url)
-
     domains = []
     seen = set()
 
@@ -383,7 +389,6 @@ async def investigate_layer2(
         domain = str(
             item.get("referring_domain") or ""
         ).strip().lower()
-
         if (
             domain
             and domain != target_domain
@@ -403,21 +408,31 @@ async def investigate_layer2(
             "backlinks": [],
         }
 
-    fallback_crawls = max(0, min(int(fallback_crawls), 4))
-    pages_per_domain = max(1, min(int(pages_per_domain), 100))
-    concurrency = max(1, min(int(concurrency), 16))
-    index_delay = max(1.0, min(float(index_delay), 10.0))
+    fallback_crawls = max(
+        0,
+        min(int(fallback_crawls), 4),
+    )
+    pages_per_domain = max(
+        1,
+        min(int(pages_per_domain), 100),
+    )
+    concurrency = max(
+        1,
+        min(int(concurrency), 16),
+    )
+    index_delay = max(
+        1.0,
+        min(float(index_delay), 10.0),
+    )
 
     timeout = httpx.Timeout(
         30.0,
         connect=12.0,
     )
-
     limits = httpx.Limits(
         max_connections=max(8, concurrency * 2),
         max_keepalive_connections=concurrency,
     )
-
     started = time.monotonic()
 
     async with httpx.AsyncClient(
@@ -430,15 +445,12 @@ async def investigate_layer2(
             client,
             fallback_crawls + 1,
         )
-
         sem = asyncio.Semaphore(concurrency)
         results = []
 
-        # Common Crawl index requests are deliberately sequential.
         for index, domain in enumerate(domains):
             if index:
                 await asyncio.sleep(index_delay)
-
             results.append(
                 await _verify_domain(
                     client,
@@ -452,7 +464,6 @@ async def investigate_layer2(
             )
 
     links = []
-
     for result in results:
         links.extend(
             [
