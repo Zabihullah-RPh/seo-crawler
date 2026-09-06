@@ -4,6 +4,22 @@ Test-only: this does not modify the production Layer 2 implementation.
 It uses the public Common Crawl CDXJ index to find captured pages on known
 referring domains, then range-fetches WARC records and checks exact links to
 the target domain.
+
+Fast adaptive sampling:
+- query the newest crawl first;
+- sample a small number of pages (10 by default);
+- only try one older crawl when the newest crawl does not confirm a link;
+- stop immediately when a page-level backlink is found.
+
+Usage:
+    python -m scripts.test_layer2_commoncrawl https://avw.au
+
+Optional:
+    --domain example.com --domain example.org
+    --crawl CC-MAIN-2026-34
+    --fallback-crawls 1
+    --pages 10
+    --concurrency 8
 """
 from __future__ import annotations
 
@@ -27,7 +43,7 @@ DEFAULT_DOMAINS = [
 ]
 CC_INDEX_BASE = "https://index.commoncrawl.org"
 CC_DATA_BASE = "https://data.commoncrawl.org"
-USER_AGENT = "SEO-Crawler-Layer2-CommonCrawl-Test/1.3 (+https://index.commoncrawl.org/)"
+USER_AGENT = "SEO-Crawler-Layer2-CommonCrawl-Test/1.4 (+https://index.commoncrawl.org/)"
 
 
 def host(url: str) -> str:
@@ -113,14 +129,14 @@ async def latest_crawls(client: httpx.AsyncClient, count: int) -> list[str]:
     return crawls[: max(1, count)]
 
 
-async def query_domain(client: httpx.AsyncClient, crawl: str, domain: str, limit: int, retries: int = 3) -> tuple[list[dict], str | None, str]:
-    """Query using documented domain/wildcard forms rather than domain/*+prefix.
-
-    Common Crawl treats `matchType=domain` as the domain-wide lookup and also
-    supports wildcard URL patterns. We try domain-wide first, then wildcard,
-    because the former is explicit and the latter is useful across index-server
-    versions. No status/mime filters are applied at query time.
-    """
+async def query_domain(
+    client: httpx.AsyncClient,
+    crawl: str,
+    domain: str,
+    limit: int,
+    retries: int = 3,
+) -> tuple[list[dict], str | None, str]:
+    """Query documented domain/wildcard forms and return the first usable result."""
     query_forms = [
         [("url", domain), ("matchType", "domain")],
         [("url", f"*.{domain}")],
@@ -157,8 +173,6 @@ async def query_domain(client: httpx.AsyncClient, crawl: str, domain: str, limit
                         records.append(item)
                 if records:
                     return records[:limit], None, f"form={form_index + 1}"
-                # An empty result from the first form is not a hard failure; try
-                # the alternative wildcard/domain forms before concluding no capture.
                 last_error = None
                 break
             except Exception as exc:
@@ -192,6 +206,7 @@ async def verify_domain(
     attempted_crawls = []
     total_records = 0
     total_pages = 0
+    total_warc_attempts = 0
     all_errors = []
 
     for crawl_index, crawl in enumerate(crawls):
@@ -207,6 +222,7 @@ async def verify_domain(
             continue
 
         found = []
+
         async def one(record: dict):
             async with sem:
                 blob = await fetch_record(client, record)
@@ -230,6 +246,7 @@ async def verify_domain(
 
         results = await asyncio.gather(*(one(record) for record in records), return_exceptions=True)
         for item in results:
+            total_warc_attempts += 1
             if isinstance(item, Exception):
                 continue
             total_pages += 1
@@ -243,6 +260,7 @@ async def verify_domain(
                     "crawls_tried": attempted_crawls,
                     "records_returned": total_records,
                     "pages_sampled": total_pages,
+                    "warc_attempts": total_warc_attempts,
                     "links_found": len(found),
                     "elapsed": round(time.monotonic() - started, 2),
                     "backlinks": found,
@@ -259,9 +277,11 @@ async def verify_domain(
         "domain": source_domain,
         "status": status,
         "crawl": attempted_crawls[-1] if attempted_crawls else None,
+        "query_form": None,
         "crawls_tried": attempted_crawls,
         "records_returned": total_records,
         "pages_sampled": total_pages,
+        "warc_attempts": total_warc_attempts,
         "links_found": 0,
         "elapsed": round(time.monotonic() - started, 2),
         "backlinks": [],
@@ -290,8 +310,9 @@ async def run(args) -> int:
         print(f"Pages/domain:      {args.pages}")
         print(f"Concurrency:       {args.concurrency}")
         print(f"Index delay:       {args.index_delay}s")
+        print("Mode:              adaptive fast sampling")
         print("\nLayer 1 is not re-run; the known referring domains are used directly.")
-        print("CDX uses domain + wildcard fallback forms; WARC content is checked for exact links.")
+        print("Newest crawl is sampled first; one older crawl is used only when needed.")
 
         sem = asyncio.Semaphore(max(1, args.concurrency))
         results = []
@@ -302,14 +323,19 @@ async def run(args) -> int:
 
     print("\nPer-domain archive verification:")
     confirmed = []
+    total_records = 0
+    total_warc_attempts = 0
     for item in results:
         extra = f" | errors={len(item.get('errors', []))}" if item.get("errors") else ""
         qform = f" | query={item.get('query_form')}" if item.get("query_form") else ""
         print(
             f"  - {item['domain']}: {item['status']} | records={item.get('records_returned', 0)} | "
-            f"pages={item.get('pages_sampled', 0)} | links={item.get('links_found', 0)} | "
-            f"crawls={','.join(item.get('crawls_tried', []))} | time={item.get('elapsed', 0)}s{qform}{extra}"
+            f"pages={item.get('pages_sampled', 0)} | WARC={item.get('warc_attempts', 0)} | "
+            f"links={item.get('links_found', 0)} | crawls={','.join(item.get('crawls_tried', []))} | "
+            f"time={item.get('elapsed', 0)}s{qform}{extra}"
         )
+        total_records += int(item.get("records_returned", 0) or 0)
+        total_warc_attempts += int(item.get("warc_attempts", 0) or 0)
         confirmed.extend(item.get("backlinks", []))
         for error in item.get("errors", []) or []:
             print(f"      ! {error}")
@@ -322,7 +348,9 @@ async def run(args) -> int:
             f"| crawl={item.get('crawl', '')} | capture={item.get('capture_timestamp', '')}"
         )
 
-    print(f"\nConfirmed links:   {len(confirmed)}")
+    print(f"\nRecords returned:  {total_records}")
+    print(f"WARC fetches:      {total_warc_attempts}")
+    print(f"Confirmed links:   {len(confirmed)}")
     print(f"Total test time:   {time.monotonic() - started:.2f}s")
     print("===============================================\n")
     return 0
@@ -333,8 +361,8 @@ def main() -> int:
     parser.add_argument("url", help="Target website URL")
     parser.add_argument("--domain", action="append", help="Known referring domain; repeat for multiple domains")
     parser.add_argument("--crawl", help="Specific Common Crawl collection; default uses latest plus fallback crawls")
-    parser.add_argument("--fallback-crawls", type=int, default=2, help="Older crawls to try after the latest crawl")
-    parser.add_argument("--pages", type=int, default=25, help="Maximum captured pages sampled per referring domain per crawl")
+    parser.add_argument("--fallback-crawls", type=int, default=1, help="Older crawls to try after the newest crawl")
+    parser.add_argument("--pages", type=int, default=10, help="Maximum captured pages sampled per referring domain per crawl")
     parser.add_argument("--concurrency", type=int, default=8, help="Concurrent WARC range fetches")
     parser.add_argument("--index-delay", type=float, default=2.0, help="Seconds between Common Crawl index requests")
     args = parser.parse_args()
