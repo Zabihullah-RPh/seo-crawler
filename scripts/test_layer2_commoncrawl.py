@@ -1,13 +1,16 @@
 """Experimental Common Crawl archive-based Layer 2 backlink test.
 
 This test does NOT modify the production Layer 2 implementation.
-It uses the public Common Crawl CDXJ index to find captured HTML pages on
-known referring domains, then range-fetches only those WARC records and checks
-for exact links to the target domain.
+It uses the public Common Crawl CDXJ index to find captured pages on
+known referring domains, then range-fetches WARC records and checks for
+exact links to the target domain.
 
-The index is queried sequentially with retries because Common Crawl rate-limits
-parallel/repeated CDX requests. When a domain has no usable captures in the
-latest crawl, the test can fall back to a small number of older crawls.
+The index lookup deliberately starts broad: capture discovery is separated
+from HTTP-status/mime filtering so a restrictive CDX filter cannot turn an
+available domain into a false "no captures" result. Common Crawl asks clients
+to avoid concurrent CDX requests, so domain lookups are sequential with a
+small delay and retries. Older crawls are used when a newer crawl has no
+usable records.
 
 Usage:
     python -m scripts.test_layer2_commoncrawl https://avw.au
@@ -41,7 +44,7 @@ DEFAULT_DOMAINS = [
 ]
 CC_INDEX_BASE = "https://index.commoncrawl.org"
 CC_DATA_BASE = "https://data.commoncrawl.org"
-USER_AGENT = "SEO-Crawler-Layer2-CommonCrawl-Test/1.1 (+https://index.commoncrawl.org/)"
+USER_AGENT = "SEO-Crawler-Layer2-CommonCrawl-Test/1.2 (+https://index.commoncrawl.org/)"
 
 
 def host(url: str) -> str:
@@ -59,8 +62,7 @@ def canonical(url: str) -> str:
         netloc = hostname
         if parsed.port:
             netloc += f":{parsed.port}"
-        path = parsed.path or "/"
-        result = f"{scheme}://{netloc}{path}"
+        result = f"{scheme}://{netloc}{parsed.path or '/'}"
         if parsed.query:
             result += f"?{parsed.query}"
         return result
@@ -97,25 +99,21 @@ def extract_links(html: str, source_url: str, target_domain: str) -> list[dict]:
 
 def extract_http_payload(warc_gzip: bytes) -> tuple[str, str] | None:
     raw = gzip.decompress(warc_gzip)
-    marker = b"\r\n\r\n"
-    first = raw.find(marker)
-    if first < 0:
-        marker = b"\n\n"
+    for marker in (b"\r\n\r\n", b"\n\n"):
         first = raw.find(marker)
-        if first < 0:
-            return None
-    remainder = raw[first + len(marker):]
-    second = remainder.find(marker)
-    if second < 0:
-        return None
-    http_headers = remainder[:second].decode("latin-1", errors="replace")
-    body = remainder[second + len(marker):]
-    content_type = ""
-    for line in http_headers.splitlines():
-        if line.lower().startswith("content-type:"):
-            content_type = line.split(":", 1)[1].strip().lower()
-            break
-    return content_type, body.decode("utf-8", errors="replace")
+        if first >= 0:
+            remainder = raw[first + len(marker):]
+            second = remainder.find(marker)
+            if second >= 0:
+                http_headers = remainder[:second].decode("latin-1", errors="replace")
+                body = remainder[second + len(marker):]
+                content_type = ""
+                for line in http_headers.splitlines():
+                    if line.lower().startswith("content-type:"):
+                        content_type = line.split(":", 1)[1].strip().lower()
+                        break
+                return content_type, body.decode("utf-8", errors="replace")
+    return None
 
 
 async def latest_crawls(client: httpx.AsyncClient, count: int) -> list[str]:
@@ -130,13 +128,23 @@ async def latest_crawls(client: httpx.AsyncClient, count: int) -> list[str]:
     return crawls[: max(1, count)]
 
 
-async def query_domain(client: httpx.AsyncClient, crawl: str, domain: str, limit: int, retries: int = 3) -> tuple[list[dict], str | None]:
+async def query_domain(
+    client: httpx.AsyncClient,
+    crawl: str,
+    domain: str,
+    limit: int,
+    retries: int = 3,
+) -> tuple[list[dict], str | None]:
+    """Broadly discover captures; perform filtering after WARC fetch.
+
+    We intentionally do not send status/mime filters here. This prevents a
+    server-side mime classification difference from hiding captures that can
+    still contain useful HTML for backlink verification.
+    """
     query_items = [
         ("url", f"{domain}/*"),
         ("matchType", "prefix"),
         ("output", "json"),
-        ("filter", "status:200"),
-        ("filter", "mime:text/html"),
         ("collapse", "urlkey"),
         ("limit", str(limit)),
     ]
@@ -223,7 +231,10 @@ async def verify_domain(
             if not parsed:
                 return []
             content_type, html = parsed
-            if "html" not in content_type:
+            # Some Common Crawl records have imperfect or missing MIME metadata;
+            # try parsing the payload anyway when it looks like HTML.
+            looks_html = "html" in content_type or "<html" in html[:1000].lower() or "<a " in html[:2000].lower()
+            if not looks_html:
                 return []
             source_url = canonical(str(record.get("url") or ""))
             return [
@@ -282,10 +293,7 @@ async def run(args) -> int:
     timeout = httpx.Timeout(30.0, connect=12.0)
     limits = httpx.Limits(max_connections=max(8, args.concurrency * 2), max_keepalive_connections=args.concurrency)
     async with httpx.AsyncClient(headers={"User-Agent": USER_AGENT}, timeout=timeout, follow_redirects=True, limits=limits) as client:
-        if args.crawl:
-            crawls = [args.crawl]
-        else:
-            crawls = await latest_crawls(client, args.fallback_crawls + 1)
+        crawls = [args.crawl] if args.crawl else await latest_crawls(client, args.fallback_crawls + 1)
         crawls = crawls[: args.fallback_crawls + 1]
 
         print("\n========== COMMON CRAWL LAYER 2 TEST ==========")
@@ -296,12 +304,10 @@ async def run(args) -> int:
         print(f"Concurrency:       {args.concurrency}")
         print(f"Index delay:       {args.index_delay}s")
         print("\nLayer 1 is not re-run; the known referring domains are used directly.")
-        print("The test uses sequential CDX requests and older-crawl fallback when needed.")
+        print("CDX lookup is broad; status/MIME decisions are made after WARC retrieval.")
 
         sem = asyncio.Semaphore(max(1, args.concurrency))
         results = []
-        # Common Crawl explicitly asks clients not to issue multiple CDX requests
-        # concurrently, so domain index lookups are intentionally sequential.
         for index, domain in enumerate(domains):
             if index:
                 await asyncio.sleep(args.index_delay)
@@ -340,7 +346,7 @@ def main() -> int:
     parser.add_argument("--domain", action="append", help="Known referring domain; repeat for multiple domains")
     parser.add_argument("--crawl", help="Specific Common Crawl collection; default uses latest plus fallback crawls")
     parser.add_argument("--fallback-crawls", type=int, default=2, help="Older crawls to try after the latest crawl")
-    parser.add_argument("--pages", type=int, default=25, help="Maximum captured HTML pages sampled per referring domain per crawl")
+    parser.add_argument("--pages", type=int, default=25, help="Maximum captured pages sampled per referring domain per crawl")
     parser.add_argument("--concurrency", type=int, default=8, help="Concurrent WARC range fetches")
     parser.add_argument("--index-delay", type=float, default=2.0, help="Seconds between Common Crawl index requests")
     args = parser.parse_args()
