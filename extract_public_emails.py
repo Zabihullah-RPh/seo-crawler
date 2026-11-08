@@ -32,7 +32,7 @@ MAX_RESPONSE_BYTES = 2_000_000
 DEFAULT_MAX_PAGES = 12
 
 EMAIL_RE = re.compile(
-    r"(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![A-Z0-9.-])",
+    r"(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![A-Z0-9-])",
     re.IGNORECASE,
 )
 OBFUSCATED_REPLACEMENTS = (
