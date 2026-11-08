@@ -323,7 +323,14 @@ def extract(url: str, name: str, title: str, max_pages: int, delay: float) -> li
 
     session.close()
     # Do not guess an address. Return only a public email with a name-based signal.
-    matched = [item for item in collected.values() if item.score >= 50]
+    wanted = name_tokens(name)
+    matched = [
+        item for item in collected.values()
+        if item.score >= 50 and (
+            context_name_match(name, item.context)
+            or (wanted and all(token in re.sub(r"[^a-z0-9]", "", item.email.split("@", 1)[0].lower()) for token in wanted))
+        )
+    ]
     return sorted(matched, key=lambda item: (-item.score, item.source_url))[:1]
 
 
