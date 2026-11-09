@@ -59,6 +59,19 @@ async def initialize():
             internal INTEGER DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS emails (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            crawl_id INTEGER NOT NULL,
+            page_url TEXT NOT NULL,
+            email TEXT NOT NULL,
+            email_domain TEXT,
+            same_domain INTEGER DEFAULT 0,
+            generic_mailbox INTEGER DEFAULT 0,
+            extraction_method TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(crawl_id, page_url, email, extraction_method)
+        );
+
         CREATE TABLE IF NOT EXISTS images (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             crawl_id INTEGER,
@@ -216,6 +229,32 @@ async def save_page(crawl_id, page):
             VALUES ({",".join(["?"] * len(columns))})
             """,
             values
+        )
+        await db.commit()
+
+
+async def save_email(crawl_id, item):
+    """Save a publicly published email candidate and where it was found."""
+    methods = item.get("extraction_methods") or []
+    method = ",".join(sorted(str(value) for value in methods)) or "unknown"
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO emails
+            (crawl_id, page_url, email, email_domain, same_domain,
+             generic_mailbox, extraction_method)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                crawl_id,
+                item.get("source_url"),
+                item.get("email"),
+                item.get("email_domain"),
+                int(bool(item.get("same_domain"))),
+                int(bool(item.get("generic_mailbox"))),
+                method,
+            )
         )
         await db.commit()
 
