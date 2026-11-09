@@ -225,6 +225,33 @@ def html_report(audit_data, crawl_data):
     platform = site.get("platform") or "Custom / Unknown"
     site_lines = f"<p><b>Platform:</b> {escape(platform)}</p><p><b>Tracking / Pixels / Tags:</b> {escape(tracking)}</p><p><b>Average DOM Load:</b> {site.get('average_dom_loaded_seconds', 0)} seconds</p><p><b>Average Fully Loaded:</b> {site.get('average_fully_loaded_seconds', 0)} seconds</p><p><b>Domain:</b> {escape(domain.get('hostname', ''))}</p><p><b>Domain Created:</b> {escape(str((domain.get('domain_age') or {}).get('created', 'Not detected')))}</p><p><b>IP:</b> {escape(', '.join(domain.get('ip_addresses', [])) or 'Not detected')}</p><p><b>Server:</b> {escape(str(domain.get('server') or 'Not disclosed'))}</p><p><b>SSL:</b> {escape('Enabled' if ssl.get('enabled') else 'Not verified')}</p>"
 
+    email_rows = []
+    for item in crawl_data.get("emails", []) or []:
+        address = escape(str(item.get("email") or ""))
+        email_domain = escape(str(item.get("email_domain") or ""))
+        methods = escape(", ".join(item.get("extraction_methods", []) or []))
+        sources = []
+        for source_url in item.get("source_pages", []) or []:
+            safe_url = escape(str(source_url), quote=True)
+            sources.append(f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">{escape(str(source_url))}</a>')
+        source_html = "<br>".join(sources) if sources else "Not recorded"
+        scope = "Same website domain" if item.get("same_domain") else "External email domain"
+        if item.get("generic_mailbox"):
+            scope += " · Generic mailbox"
+        email_rows.append(
+            f"<tr><td>{address}</td><td>{email_domain}</td><td>{escape(scope)}</td><td>{methods}</td><td>{source_html}</td></tr>"
+        )
+    if not email_rows:
+        email_rows.append('<tr><td colspan="5">No public email addresses were found.</td></tr>')
+    email_section = (
+        '<div class="site"><h2>Public Email Addresses</h2>'
+        f'<p><b>Unique addresses:</b> {len(crawl_data.get("emails", []) or [])}</p>'
+        '<p>These are addresses publicly present on crawled pages. They have not been independently verified.</p>'
+        '<table><tr><th>Email</th><th>Email Domain</th><th>Classification</th><th>Found Via</th><th>Source Page</th></tr>'
+        + "".join(email_rows)
+        + "</table></div>"
+    )
+
     backlinks = crawl_data.get("backlinks", {}) or {}
     layer1 = backlinks.get("layer1", {}) or {}
     layer2 = backlinks.get("layer2", {}) or {}
@@ -248,7 +275,7 @@ def html_report(audit_data, crawl_data):
 
     return f'''<!doctype html><html><head><meta charset="utf-8"><title>SEO Audit Report - Crawl {crawl_data.get('crawl_id')}</title><style>
 body{{font-family:Arial,sans-serif;background:#f4f5f7;color:#222;margin:0;padding:35px}}.container{{max-width:1400px;margin:auto;background:#fff;padding:35px}}.metrics{{display:flex;gap:20px;margin:25px 0}}.metric{{flex:1;border:1px solid #ddd;padding:20px;border-radius:8px}}.metric strong{{display:block;font-size:30px;margin-top:8px}}.score-red{{color:#dc2626!important}}.score-orange{{color:#d97706!important}}.score-green{{color:#16a34a!important}}.pages-blue{{color:#2563eb!important}}.site{{border:1px solid #ddd;padding:20px;margin-bottom:30px}}table{{width:100%;border-collapse:collapse;background:#fff}}th,td{{border:1px solid #ddd;padding:12px;text-align:left;vertical-align:top}}th{{background:#eee}}a{{color:#2563eb;text-decoration:underline}}a:hover{{text-decoration:none}}.legend{{font-size:13px;color:#666;margin-top:8px}}
-</style></head><body><div class="container"><h1>SEO Audit Report</h1><p>Crawl ID: {crawl_data.get('crawl_id')}</p><div class="metrics"><div class="metric">SEO Score<strong class="{_score_class(s['seo_score'])}">{s['seo_score']}/100</strong></div><div class="metric">Site Health<strong class="{_score_class(s['site_health'])}">{s['site_health']}/100</strong></div><div class="metric">Pages Crawled<strong class="{_crawl_coverage_class(s['crawl_coverage_score'])}">{s['crawl_coverage_score']}/10</strong></div></div><div class="site"><h2>Site-Wide Information</h2>{site_lines}</div>{backlink_section}<h2>Issues by Page</h2><table><tr><th>Page</th><th>Problems / Opportunities</th></tr>{''.join(rows)}</table></div></body></html>'''
+</style></head><body><div class="container"><h1>SEO Audit Report</h1><p>Crawl ID: {crawl_data.get('crawl_id')}</p><div class="metrics"><div class="metric">SEO Score<strong class="{_score_class(s['seo_score'])}">{s['seo_score']}/100</strong></div><div class="metric">Site Health<strong class="{_score_class(s['site_health'])}">{s['site_health']}/100</strong></div><div class="metric">Pages Crawled<strong class="{_crawl_coverage_class(s['crawl_coverage_score'])}">{s['crawl_coverage_score']}/10</strong></div></div><div class="site"><h2>Site-Wide Information</h2>{site_lines}</div>{email_section}{backlink_section}<h2>Issues by Page</h2><table><tr><th>Page</th><th>Problems / Opportunities</th></tr>{''.join(rows)}</table></div></body></html>'''
 
 
 def generate_report(data, source_path):
