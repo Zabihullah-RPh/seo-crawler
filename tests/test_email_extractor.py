@@ -64,6 +64,14 @@ class EmailExtractionTests(unittest.TestCase):
         self.assertFalse(records[0]["same_domain"])
         self.assertEqual(records[0]["email_domain"], "gmail.com")
 
+    def test_flags_recruitment_as_a_shared_mailbox(self):
+        records = extract_emails(
+            "<p>Send CVs to recruitment@example.com</p>",
+            "https://example.com/",
+        )
+        self.assertEqual(len(records), 1)
+        self.assertTrue(records[0]["generic_mailbox"])
+
 
 if __name__ == "__main__":
     unittest.main()
