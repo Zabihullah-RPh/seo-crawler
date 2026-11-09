@@ -12,6 +12,8 @@ from urllib.parse import urljoin, urlparse
 from app.crawler.browser import BrowserClient
 from app.crawler.http import HTTPClient
 from app.crawler.parser import parse_html
+from app.crawler.robots import RobotsManager
+from app.config import DEFAULT_USER_AGENT
 from app.storage.db import save_page, save_issue, save_image, save_resource, save_hreflang, save_schema, update_crawl
 from app.storage.persistence import CrawlPersistence
 from app.analyzers.technical import analyze
@@ -100,7 +102,7 @@ class ProductionCrawler:
     def __init__(self, crawl_id, start_url, max_pages=100000, max_depth=50, concurrency=20):
         self.crawl_id = crawl_id; self.start_url = normalize_url(start_url); self.max_pages = int(max_pages); self.max_depth = int(max_depth); self.concurrency = int(concurrency)
         self.discovered, self.crawled, self.failed = set(), set(), set(); self.queue, self.running = [], True
-        self.http = HTTPClient(concurrency=self.concurrency); self.browser = BrowserClient(concurrency=min(5, self.concurrency)); self.persistence = CrawlPersistence(self.crawl_id); self.site = {}
+        self.http = HTTPClient(concurrency=self.concurrency); self.browser = BrowserClient(concurrency=min(5, self.concurrency)); self.robots = RobotsManager(self.start_url, DEFAULT_USER_AGENT); self.persistence = CrawlPersistence(self.crawl_id); self.site = {}
     def _add_url(self, url, depth):
         try: url = normalize_url(url)
         except Exception: return False
@@ -111,9 +113,34 @@ class ProductionCrawler:
     def _persist_failed(self, url, error): self.persistence.save_failed({"url": url, "error": str(error) if error else None})
     async def process(self, url, depth):
         try:
-            result = await self.http.get(url); response = result.get("response")
-            if not response: self.failed.add(url); self._persist_failed(url, result.get("error")); return
-            status = getattr(response, "status_code", 0); final_url = str(getattr(response, "url", url)); headers = dict(getattr(response, "headers", {}) or {}); content_type = headers.get("content-type", ""); content = getattr(response, "content", b"") or b""; text = getattr(response, "text", "") or ""
+            if not self.robots.allowed(url):
+                reason = self.robots.blocked_reason or "Disallowed by robots.txt; no request attempted."
+                self.failed.add(url)
+                self._persist_failed(url, reason)
+                print(f"[ROBOTS BLOCKED] {url} | {reason}")
+                return
+
+            result = await self.http.get(url)
+            response = result.get("response")
+            if not response:
+                self.failed.add(url)
+                self._persist_failed(url, result.get("error"))
+                return
+
+            status = getattr(response, "status_code", 0)
+            final_url = str(getattr(response, "url", url))
+            headers = dict(getattr(response, "headers", {}) or {})
+            content_type = headers.get("content-type", "")
+            content = getattr(response, "content", b"") or b""
+            text = getattr(response, "text", "") or ""
+
+            if status >= 400:
+                reason = f"HTTP {status}; request stopped without another attempt."
+                self.failed.add(url)
+                self._persist_failed(url, reason)
+                print(f"[HTTP BLOCKED] {url} | {reason}")
+                return
+
             if "text/html" not in content_type.lower():
                 page = {"url": url, "final_url": final_url, "status_code": status, "depth": depth, "content_type": content_type, "response_time": result.get("elapsed", 0), "content_length": len(content), "title": "", "meta_description": "", "canonical": "", "robots": "", "language": "", "viewport": "", "word_count": 0, "content_hash": hashlib.sha256(content).hexdigest(), "is_indexable": False, "redirect": final_url != url, "error": None}
                 await save_page(self.crawl_id, page); self._persist_page(page); return
@@ -151,20 +178,92 @@ class ProductionCrawler:
         except Exception as e:
             self.failed.add(url); self._persist_failed(url, e); print(f"[FAILED] {url} | {type(e).__name__}: {e}")
     async def run(self):
-        self._add_url(self.start_url, 0); self.persistence.update_meta(start_url=self.start_url, max_pages=self.max_pages, max_depth=self.max_depth, concurrency=self.concurrency); await update_crawl(self.crawl_id, status="running", started_at=datetime.utcnow().isoformat()); await self.browser.start()
+        self._add_url(self.start_url, 0)
+        self.persistence.update_meta(
+            start_url=self.start_url,
+            max_pages=self.max_pages,
+            max_depth=self.max_depth,
+            concurrency=self.concurrency,
+        )
+        await update_crawl(
+            self.crawl_id,
+            status="running",
+            started_at=datetime.utcnow().isoformat(),
+        )
+
         try:
+            robots_result = await self.robots.load(self.http)
+            if not self.robots.allowed(self.start_url):
+                reason = self.robots.blocked_reason or "Start URL disallowed by robots.txt."
+                self.failed.add(self.start_url)
+                self._persist_failed(self.start_url, reason)
+                self.persistence.update_meta(
+                    pages_saved=0,
+                    discovered=len(self.discovered),
+                    failed=len(self.failed),
+                    robots_status=robots_result.get("status"),
+                    blocked_reason=reason,
+                )
+                self.persistence.finish("completed")
+                await update_crawl(
+                    self.crawl_id,
+                    status="completed",
+                    pages_discovered=len(self.discovered),
+                    pages_crawled=0,
+                    pages_indexable=0,
+                    finished_at=datetime.utcnow().isoformat(),
+                )
+                print(f"[ROBOTS BLOCKED] {self.start_url} | {reason}")
+                return
+
+            await self.browser.start()
+
             while self.queue and len(self.crawled) < self.max_pages and self.running:
-                batch=[]
-                while self.queue and len(batch)<self.concurrency and len(self.crawled)<self.max_pages:
-                    url,depth=self.queue.pop(0)
-                    if url in self.crawled: continue
-                    self.crawled.add(url); batch.append(self.process(url,depth))
-                if batch: await asyncio.gather(*batch, return_exceptions=True)
-                self.persistence.update_meta(pages_saved=len(self.crawled), discovered=len(self.discovered), failed=len(self.failed))
-            self.persistence.finish("completed"); await update_crawl(self.crawl_id,status="completed",pages_discovered=len(self.discovered),pages_crawled=len(self.crawled),pages_indexable=sum(1 for p in self.crawled if p)); await self._export_and_report(); print("\n========== CRAWL COMPLETE =========="); print(f"Discovered: {len(self.discovered)}"); print(f"Crawled: {len(self.crawled)}"); print(f"Failed: {len(self.failed)}")
+                batch = []
+                while self.queue and len(batch) < self.concurrency and len(self.crawled) < self.max_pages:
+                    url, depth = self.queue.pop(0)
+                    if url in self.crawled:
+                        continue
+                    self.crawled.add(url)
+                    batch.append(self.process(url, depth))
+
+                if batch:
+                    await asyncio.gather(*batch, return_exceptions=True)
+
+                self.persistence.update_meta(
+                    pages_saved=len(self.crawled),
+                    discovered=len(self.discovered),
+                    failed=len(self.failed),
+                )
+
+            self.persistence.finish("completed")
+            await update_crawl(
+                self.crawl_id,
+                status="completed",
+                pages_discovered=len(self.discovered),
+                pages_crawled=len(self.crawled),
+                pages_indexable=sum(1 for p in self.crawled if p),
+                finished_at=datetime.utcnow().isoformat(),
+            )
+            await self._export_and_report()
+            print("\\n========== CRAWL COMPLETE ==========")
+            print(f"Discovered: {len(self.discovered)}")
+            print(f"Crawled: {len(self.crawled)}")
+            print(f"Failed: {len(self.failed)}")
+
         except Exception:
-            self.persistence.finish("failed"); await update_crawl(self.crawl_id,status="failed",finished_at=datetime.utcnow().isoformat()); raise
-        finally: await self.browser.close(); await self.http.close()
+            self.persistence.finish("failed")
+            await update_crawl(
+                self.crawl_id,
+                status="failed",
+                finished_at=datetime.utcnow().isoformat(),
+            )
+            raise
+
+        finally:
+            await self.browser.close()
+            await self.http.close()
+
     async def _export_and_report(self):
         import sqlite3
         from app.audit_engine import generate_report
