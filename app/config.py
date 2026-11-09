@@ -28,8 +28,9 @@ DEFAULT_MAX_DEPTH = int(
 )
 
 # Retries means additional attempts after the first. Default: 1 retry / 2 attempts total.
-MAX_RETRIES = int(
-    os.getenv("CRAWLER_MAX_RETRIES", "1")
+MAX_RETRIES = min(
+    max(int(os.getenv("CRAWLER_MAX_RETRIES", "1")), 0),
+    1,
 )
 
 MAX_REDIRECTS = int(
