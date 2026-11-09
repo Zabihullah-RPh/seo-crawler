@@ -9,6 +9,9 @@ on:
       - "app/crawler/http.py"
       - "app/crawler/parser.py"
       - "app/crawler/robots.py"
+      - "app/config.py"
+      - "app/crawler/production.py"
+      - "tests/**"
   workflow_dispatch:
 
 permissions:
@@ -31,6 +34,11 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Validate retry policy
+        run: |
+          python -m compileall -q app/crawler tests
+          python -m unittest discover -s tests -v
 
       - name: Run eight-company public email scan
         run: python email_discovery_benchmark.py
