@@ -13,6 +13,7 @@ class CrawlPersistence:
 
         self.pages_file = self.base_dir / f"crawl_{self.crawl_id}_pages.jsonl"
         self.links_file = self.base_dir / f"crawl_{self.crawl_id}_links.jsonl"
+        self.emails_file = self.base_dir / f"crawl_{self.crawl_id}_emails.jsonl"
         self.failed_file = self.base_dir / f"crawl_{self.crawl_id}_failed.jsonl"
         self.meta_file = self.base_dir / f"crawl_{self.crawl_id}_meta.json"
 
@@ -62,6 +63,9 @@ class CrawlPersistence:
     def save_link(self, link):
         self._append(self.links_file, link)
 
+    def save_email(self, email):
+        self._append(self.emails_file, email)
+
     def save_failed(self, failed):
         self._append(self.failed_file, failed)
 
@@ -103,6 +107,7 @@ class CrawlPersistence:
             "crawl_id": self.crawl_id,
             "pages": count(self.pages_file),
             "links": count(self.links_file),
+            "emails": count(self.emails_file),
             "failed": count(self.failed_file),
             "meta": str(self.meta_file)
         }
