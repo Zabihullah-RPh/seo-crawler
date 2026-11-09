@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark public-site email discovery with the existing crawler fetch/parser modules.
+"""Benchmark the production email extractor on eight public business websites.
 
-This is an experiment, not an existing production email-extraction feature.
-Only counts and timings are written; addresses are not logged or saved.
+The CSV includes publicly published email candidates and their source pages.
+Addresses are not printed to the Actions log.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlparse, urldefrag
 
 from bs4 import BeautifulSoup
 
+from app.crawler.email_extractor import extract_emails
 from app.crawler.http import HTTPClient
 from app.crawler.parser import parse_html
 from app.crawler.robots import RobotsManager
@@ -43,6 +44,7 @@ CONTACT_TERMS = (
 MAX_EXTRA_PAGES = 3
 OUTPUT = Path("email-crawler-benchmark.csv")
 SUMMARY = Path("email-crawler-benchmark-summary.txt")
+EMAILS_OUTPUT = Path("email-crawler-public-emails.csv")
 
 
 def _same_host(base_url: str, target_url: str) -> bool:
@@ -95,13 +97,14 @@ async def _fetch_html(http: HTTPClient, url: str):
     result = await http.get(url)
     response = result.get("response")
     if not response or response.status_code >= 400:
-        return None, None, 0.0, f"HTTP/error {getattr(response, 'status_code', 'request failed')}"
+        return None, None, 0.0, f"HTTP/error {getattr(response, 'status_code', 'request failed')}", url
     content_type = response.headers.get("content-type", "").lower()
     if "html" not in content_type and "xhtml" not in content_type:
-        return None, None, result.get("elapsed", 0.0), "not HTML"
+        return None, None, result.get("elapsed", 0.0), "not HTML", url
     raw_html = response.text
-    parsed = parse_html(raw_html, str(response.url))
-    return raw_html, parsed, float(result.get("elapsed", 0.0)), ""
+    final_url = str(response.url)
+    parsed = parse_html(raw_html, final_url)
+    return raw_html, parsed, float(result.get("elapsed", 0.0)), "", final_url
 
 
 async def _scan_company(http: HTTPClient, name: str, url: str) -> dict:
@@ -120,30 +123,54 @@ async def _scan_company(http: HTTPClient, name: str, url: str) -> dict:
             "status": "blocked by robots.txt",
         }
 
-    email_set: set[str] = set()
-    raw_html, parsed, _, error = await _fetch_html(http, url)
+    email_map = {}
+    raw_html, parsed, _, error, final_url = await _fetch_html(http, url)
     pages_checked = 0
+
+    def add_page_emails(markup: str, page_url: str):
+        for candidate in extract_emails(markup, page_url):
+            address = candidate["email"]
+            if address not in email_map:
+                email_map[address] = {
+                    **candidate,
+                    "company": name,
+                    "company_domain": urlparse(url).hostname or url,
+                    "source_pages": [page_url],
+                }
+            else:
+                current = email_map[address]
+                if page_url not in current["source_pages"]:
+                    current["source_pages"].append(page_url)
+                methods = set(current["extraction_methods"])
+                methods.update(candidate["extraction_methods"])
+                current["extraction_methods"] = sorted(methods)
+
     if raw_html is not None and parsed is not None:
         pages_checked += 1
-        email_set.update(_emails_from_page(raw_html, parsed.get("text", "")))
-        candidates = _contact_candidates(raw_html, str(url), url, robots)
+        add_page_emails(raw_html, final_url)
+        candidates = _contact_candidates(raw_html, final_url, url, robots)
         delay = robots.crawl_delay() or 0
         for target in candidates:
             if delay:
                 await asyncio.sleep(min(float(delay), 10.0))
-            page_html, page_parsed, _, _ = await _fetch_html(http, target)
+            page_html, page_parsed, _, _, page_final_url = await _fetch_html(http, target)
             if page_html is None or page_parsed is None:
                 continue
             pages_checked += 1
-            email_set.update(_emails_from_page(page_html, page_parsed.get("text", "")))
+            add_page_emails(page_html, page_final_url)
+
+    emails = sorted(email_map.values(), key=lambda item: item["email"])
+    for item in emails:
+        item["source_pages"].sort()
     elapsed = round(time.perf_counter() - started, 3)
     return {
         "company": name,
         "domain": urlparse(url).hostname or url,
         "pages_checked": pages_checked,
-        "public_email_count": len(email_set),
+        "public_email_count": len(emails),
         "elapsed_seconds": elapsed,
         "status": "ok" if pages_checked else (error or "no HTML page fetched"),
+        "emails": emails,
     }
 
 
@@ -173,6 +200,29 @@ async def main() -> None:
             rows.append(result)
 
     total_elapsed = round(time.perf_counter() - total_started, 3)
+    email_rows = []
+    for row in rows:
+        for item in row.get("emails", []):
+            email_rows.append({
+                "company": item["company"],
+                "company_domain": item["company_domain"],
+                "email": item["email"],
+                "email_domain": item["email_domain"],
+                "same_domain": item["same_domain"],
+                "generic_mailbox": item["generic_mailbox"],
+                "source_pages": " | ".join(item["source_pages"]),
+                "extraction_methods": ", ".join(item["extraction_methods"]),
+            })
+
+    email_fields = [
+        "company", "company_domain", "email", "email_domain",
+        "same_domain", "generic_mailbox", "source_pages", "extraction_methods",
+    ]
+    with EMAILS_OUTPUT.open("w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.DictWriter(file, fieldnames=email_fields)
+        writer.writeheader()
+        writer.writerows(email_rows)
+
     fields = [
         "company", "domain", "pages_checked",
         "public_email_count", "elapsed_seconds", "status",
@@ -185,12 +235,14 @@ async def main() -> None:
     summary = [
         f"Companies attempted: {len(TARGETS)}",
         f"Companies with at least one public email candidate: {sum(1 for row in rows if row['public_email_count'] > 0)}",
-        f"Distinct public email candidates (count only): {sum(int(row['public_email_count']) for row in rows)}",
+        f"Unique public email candidates saved: {len({row['email'] for row in email_rows})}",
+        f"Email source rows saved: {len(email_rows)}",
         f"HTML pages checked: {sum(int(row['pages_checked']) for row in rows)}",
         f"Total elapsed seconds (8 companies scanned concurrently): {total_elapsed}",
-        "Email addresses logged or stored: 0",
-        "Method: SEO-Crawler HTTPClient + RobotsManager + parse_html; test-only regex/mailto extraction.",
+        f"Email CSV: {EMAILS_OUTPUT}",
+        "Method: production extract_emails() used by the SEO crawler.",
         "Scope: homepage plus up to three internal contact/about/team pages per domain.",
+        "Only addresses published in visible page text, mailto links or JSON-LD are included.",
     ]
     SUMMARY.write_text("\n".join(summary) + "\n", encoding="utf-8")
     print("\n".join(summary))
