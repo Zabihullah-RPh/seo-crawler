@@ -11,7 +11,9 @@ DEFAULT_USER_AGENT = os.getenv(
     "SEO-Crawler/1.0"
 )
 
-DEFAULT_TIMEOUT = float(os.getenv("CRAWLER_TIMEOUT", "30"))
+# Keep normal page requests bounded; robots.txt gets a shorter, single attempt.
+DEFAULT_TIMEOUT = float(os.getenv("CRAWLER_TIMEOUT", "15"))
+ROBOTS_TIMEOUT = float(os.getenv("CRAWLER_ROBOTS_TIMEOUT", "8"))
 
 DEFAULT_CONCURRENCY = int(
     os.getenv("CRAWLER_CONCURRENCY", "20")
@@ -25,8 +27,9 @@ DEFAULT_MAX_DEPTH = int(
     os.getenv("CRAWLER_MAX_DEPTH", "50")
 )
 
+# Retries means additional attempts after the first. Default: 1 retry / 2 attempts total.
 MAX_RETRIES = int(
-    os.getenv("CRAWLER_MAX_RETRIES", "3")
+    os.getenv("CRAWLER_MAX_RETRIES", "1")
 )
 
 MAX_REDIRECTS = int(
