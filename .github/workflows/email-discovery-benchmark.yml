@@ -1,0 +1,46 @@
+name: Email Discovery Benchmark - 8 Low-DR Companies
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "email_discovery_benchmark.py"
+      - ".github/workflows/email-discovery-benchmark.yml"
+      - "app/crawler/http.py"
+      - "app/crawler/parser.py"
+      - "app/crawler/robots.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install crawler requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run eight-company public email scan
+        run: python email_discovery_benchmark.py
+
+      - name: Upload timing and count results only
+        uses: actions/upload-artifact@v4
+        with:
+          name: email-discovery-benchmark
+          path: |
+            email-crawler-benchmark.csv
+            email-crawler-benchmark-summary.txt
+          if-no-files-found: error
+          retention-days: 30
