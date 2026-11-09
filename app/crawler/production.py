@@ -268,8 +268,13 @@ class ProductionCrawler:
         import sqlite3
         from app.audit_engine import generate_report
         from app.integrations.common_crawl_runtime import collect as collect_layer1
-        from app.integrations.common_crawl_layer2 import investigate_layer2 as investigate_archive_layer2
         from app.integrations.backlink_layer2 import investigate_layer2 as investigate_live_layer2
+        try:
+            from app.integrations.common_crawl_layer2 import investigate_layer2 as investigate_archive_layer2
+        except ModuleNotFoundError:
+            # The archive-specific Layer 2 module is optional in this repository version.
+            # Fall back to live verification rather than failing the completed crawl.
+            investigate_archive_layer2 = None
         os.makedirs("results", exist_ok=True); db="data/crawler.db"; out=Path(f"results/crawl_{self.crawl_id}.json")
         con=sqlite3.connect(db); con.row_factory=sqlite3.Row
         pages=[dict(r) for r in con.execute("SELECT * FROM pages WHERE crawl_id=? ORDER BY id",(self.crawl_id,))]; links=[dict(r) for r in con.execute("SELECT * FROM links WHERE crawl_id=? ORDER BY id",(self.crawl_id,))]; images=[dict(r) for r in con.execute("SELECT * FROM images WHERE crawl_id=? ORDER BY id",(self.crawl_id,))]; resources=[dict(r) for r in con.execute("SELECT * FROM resources WHERE crawl_id=? ORDER BY id",(self.crawl_id,))]; schemas=[dict(r) for r in con.execute("SELECT * FROM schemas WHERE crawl_id=? ORDER BY id",(self.crawl_id,))]; failed=[dict(r) for r in con.execute("SELECT * FROM issues WHERE crawl_id=? AND severity IN ('high','critical')",(self.crawl_id,))]; con.close()
@@ -290,11 +295,18 @@ class ProductionCrawler:
             layer1=collect_layer1(self.start_url); backlinks["layer1"]=layer1
             if layer1.get("status")=="success" and layer1.get("backlinks"):
                 print(f"[BACKLINKS] Layer 1 found {layer1.get('referring_domains',0)} referring domains; starting archive-first Layer 2 investigation")
-                layer2=await investigate_archive_layer2(self.start_url,layer1)
-                if layer2.get("status")=="index_unavailable":
-                    print("[BACKLINKS] Common Crawl archive index unavailable; falling back to live Layer 2")
-                    layer2=await investigate_live_layer2(self.start_url,layer1); layer2["found_via"]="live_crawl_fallback"
-                else: layer2["found_via"]="common_crawl_warc"
+                if investigate_archive_layer2 is None:
+                    print("[BACKLINKS] Archive Layer 2 module is unavailable; falling back to live Layer 2")
+                    layer2=await investigate_live_layer2(self.start_url,layer1)
+                    layer2["found_via"]="live_crawl_fallback_missing_archive_module"
+                else:
+                    layer2=await investigate_archive_layer2(self.start_url,layer1)
+                    if layer2.get("status")=="index_unavailable":
+                        print("[BACKLINKS] Common Crawl archive index unavailable; falling back to live Layer 2")
+                        layer2=await investigate_live_layer2(self.start_url,layer1)
+                        layer2["found_via"]="live_crawl_fallback"
+                    else:
+                        layer2["found_via"]="common_crawl_warc"
                 backlinks["layer2"]=layer2
             else: backlinks["layer2"]={"status":"skipped","reason":layer1.get("status","unknown"),"links_found":0,"backlinks":[]}
         except Exception as exc: backlinks["layer2"]={"status":"failed","links_found":0,"backlinks":[],"message":f"{type(exc).__name__}: {exc}"}
