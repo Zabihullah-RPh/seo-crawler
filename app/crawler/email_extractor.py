@@ -20,7 +20,8 @@ EMAIL_RE = re.compile(
 GENERIC_LOCAL_PARTS = {
     "admin", "billing", "careers", "contact", "enquiries", "enquiry",
     "hello", "help", "hr", "info", "jobs", "marketing", "media",
-    "office", "orders", "press", "privacy", "sales", "support", "webmaster",
+    "office", "orders", "press", "privacy", "recruitment", "sales",
+    "support", "webmaster",
 }
 
 
