@@ -50,5 +50,6 @@ jobs:
           path: |
             email-crawler-benchmark.csv
             email-crawler-benchmark-summary.txt
+            email-crawler-public-emails.csv
           if-no-files-found: error
           retention-days: 30
