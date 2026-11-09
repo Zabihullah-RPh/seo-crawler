@@ -228,7 +228,7 @@ async def main() -> None:
         "public_email_count", "elapsed_seconds", "status",
     ]
     with OUTPUT.open("w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=fields)
+        writer = csv.DictWriter(file, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
