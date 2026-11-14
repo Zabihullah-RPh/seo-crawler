@@ -96,22 +96,49 @@ jobs:
           echo "Crawl ID: $CRAWL_ID"
 
           while true; do
-            STATUS=$(python -c "import requests; print(requests.get('http://127.0.0.1:8000/crawl/$CRAWL_ID').json().get('status','unknown'))")
+            STATUS="status_check_error"
+
+            # Retry temporary status API failures before deciding that the crawler stopped.
+            for attempt in {1..3}; do
+              if STATUS=$(python -c "import requests; r=requests.get('http://127.0.0.1:8000/crawl/$CRAWL_ID',timeout=20); r.raise_for_status(); print(r.json().get('status','unknown'))"); then
+                break
+              fi
+              echo "Status check failed ($attempt/3); retrying..."
+              sleep 10
+            done
+
+            if [ "$STATUS" = "status_check_error" ]; then
+              if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+                echo "Crawler server process stopped before a terminal crawl status was recorded."
+                cat crawler.log || true
+                exit 1
+              fi
+              echo "Crawler server is still running; will continue checking."
+              sleep 10
+              continue
+            fi
 
             echo "Crawl status: $STATUS"
 
-            if [ "$STATUS" = "completed" ]; then
-              echo "Crawl completed successfully."
-              break
-            fi
+            case "$STATUS" in
+              completed)
+                echo "Crawl completed successfully."
+                break
+                ;;
+              failed|stopped|cancelled|canceled|interrupted|error)
+                echo "Crawler stopped with terminal status: $STATUS"
+                cat crawler.log || true
+                exit 1
+                ;;
+            esac
 
-            if [ "$STATUS" = "failed" ]; then
-              echo "Crawl failed."
-              cat crawler.log
+            if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+              echo "Crawler server process stopped while crawl status was: $STATUS"
+              cat crawler.log || true
               exit 1
             fi
 
-            sleep 5
+            sleep 10
           done
 
 
