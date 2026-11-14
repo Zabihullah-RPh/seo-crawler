@@ -102,6 +102,8 @@ jobs:
             for attempt in {1..3}; do
               if STATUS=$(python -c "import requests; r=requests.get('http://127.0.0.1:8000/crawl/$CRAWL_ID',timeout=20); r.raise_for_status(); print(r.json().get('status','unknown'))"); then
                 break
+              else
+                STATUS="status_check_error"
               fi
               echo "Status check failed ($attempt/3); retrying..."
               sleep 10
