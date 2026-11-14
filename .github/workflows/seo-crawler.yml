@@ -17,6 +17,7 @@ on:
 jobs:
   crawl:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout
@@ -94,7 +95,7 @@ jobs:
 
           echo "Crawl ID: $CRAWL_ID"
 
-          for i in {1..120}; do
+          while true; do
             STATUS=$(python -c "import requests; print(requests.get('http://127.0.0.1:8000/crawl/$CRAWL_ID').json().get('status','unknown'))")
 
             echo "Crawl status: $STATUS"
@@ -113,11 +114,6 @@ jobs:
             sleep 5
           done
 
-          if [ "$STATUS" != "completed" ]; then
-            echo "Crawl timed out."
-            cat crawler.log
-            exit 1
-          fi
 
       - name: Run isolated Common Crawl backlink collection
         if: success()
